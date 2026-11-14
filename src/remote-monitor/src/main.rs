@@ -561,6 +561,8 @@ function showConn(host, port, conn_type, expires_at) {{
   connDiv.style.display = 'block';
   if (conn_type === 'nc') {{
     connStr.textContent = 'nc ' + host + ' ' + port;
+  }} else if (conn_type === 'udp') {{
+    connStr.textContent = 'nc -u ' + host + ' ' + port;
   }} else if (conn_type === 'http') {{
     connStr.textContent = 'http://' + host + ':' + port;
   }} else if (conn_type === 'ssh') {{
@@ -1129,7 +1131,7 @@ async fn instance_request_handler(
 
     // Pre-generate the container/project name so the orphan checker sees it as tracked
     // immediately (before compose::up returns and updates the row).
-    let pre_container_name = instance::container_name(&body.challenge_name);
+    let pre_container_name = instance::container_name(&body.challenge_name, team_id);
 
     // Insert provisioning stub before spawning; UNIQUE constraint means a concurrent
     // request racing past the check above will hit INSERT OR IGNORE and we return 409.
@@ -1451,7 +1453,7 @@ async fn plugin_request_handler(
 
     // Pre-generate the container/project name so the orphan checker sees it as tracked
     // immediately (before compose::up returns and updates the row).
-    let pre_container_name = instance::container_name(&body.challenge_name);
+    let pre_container_name = instance::container_name(&body.challenge_name, body.team_id);
 
     // Insert stub immediately so the client can poll for status
     if let Err(e) = db::insert_provisioning_stub(

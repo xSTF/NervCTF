@@ -81,7 +81,14 @@ instance:
   #   app:   [80]
   #   admin: [8080]
 
-  connection: nc              # nc | http | ssh
+  # Protocol — any port may be UDP by suffixing it with /udp (works with internal_ports,
+  # the scalar internal_port, and service_ports alike). Mixed TCP/UDP ports in one
+  # instance are fine. Default is TCP.
+  # internal_ports: ["1337/udp"]
+  # internal_ports: [1337, "53/udp"]   # first port (TCP here) stays primary
+
+  connection: nc              # nc | http | ssh — ignored for display when the primary
+                              # port is UDP: players always see 'nc -u host port' then.
   command: null               # override the container entrypoint or CMD
   timeout_minutes: 45
   max_renewals: 3

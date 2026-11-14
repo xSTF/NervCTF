@@ -310,6 +310,17 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                     }
                     if inst.connection.trim().is_empty() {
                         issues.push(Issue::error(name, "instance.connection", "required (e.g. 'nc', 'http', 'ssh')"));
+                    } else if let Some(primary) = inst.internal_ports.first() {
+                        if primary.is_udp() && !matches!(inst.connection.as_str(), "nc" | "udp") {
+                            issues.push(Issue::warn(
+                                name,
+                                "instance.connection",
+                                format!(
+                                    "primary port {} is UDP but connection is '{}' — players will be shown 'nc -u' regardless; set connection: nc for clarity",
+                                    primary, inst.connection,
+                                ),
+                            ));
+                        }
                     }
                     // timeout_minutes: 0 means instances would expire instantly
                     if inst.timeout_minutes == Some(0) {

@@ -13,6 +13,17 @@ use serde_json::Value;
 use mysql_async::Pool;
 use crate::db::Db;
 
+/// The connection type to show players for the primary port: `"udp"` overrides the
+/// challenge's declared `connection` (nc/http/ssh) whenever the primary port itself is
+/// UDP, since `nc -u` (not plain `nc`) is required to reach it.
+fn effective_connection_type(connection: &str, primary_protocol: &str) -> String {
+    if primary_protocol == "udp" {
+        "udp".to_string()
+    } else {
+        connection.to_string()
+    }
+}
+
 /// Generate a random flag for `flag_mode = "random"`, or return None for static/no flag.
 pub fn generate_flag(config: &Value) -> Option<String> {
     if config["flag_mode"].as_str().unwrap_or("static") != "random" {
@@ -40,15 +51,16 @@ pub fn sanitize_name(name: &str) -> String {
 }
 
 /// Generate a unique container/project name for an instance.
-/// Uses 6 random lowercase alphanumeric chars to avoid name collisions
+/// Includes `team_id` so `docker ps`/`docker logs` identify the owning team without a
+/// DB lookup. The 6 random lowercase alphanumeric chars still avoid name collisions
 /// when a team re-provisions before the previous container is fully torn down.
-pub fn container_name(challenge_name: &str) -> String {
+pub fn container_name(challenge_name: &str, team_id: i64) -> String {
     let suffix: String = rand::thread_rng()
         .sample_iter(Alphanumeric)
         .take(6)
         .map(|c| (c as char).to_ascii_lowercase())
         .collect();
-    format!("ctf-{}-{}", sanitize_name(challenge_name), suffix)
+    format!("ctf-{}-{}-{}", sanitize_name(challenge_name), team_id, suffix)
 }
 
 /// Stop and remove a container/project for an instance (called on expiry or explicit stop).
@@ -119,7 +131,7 @@ pub async fn provision(
             let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
             let port_mappings: Vec<(u16, u32, String)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, (i, proto))| (h, *i, proto.clone())).collect();
             let host_port = host_ports[0];
-            let cname = container_name_hint.clone().unwrap_or_else(|| container_name(challenge_name));
+            let cname = container_name_hint.clone().unwrap_or_else(|| container_name(challenge_name, team_id));
 
             let flag = generate_flag(config);
             let flag_delivery = config["flag_delivery"].as_str().unwrap_or("env");
@@ -155,6 +167,7 @@ pub async fn provision(
 
             let extra_ports = build_extra_ports_json(&port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
+            let connection = effective_connection_type(&connection, &port_mappings[0].2);
 
             // Write instance to SQLite before creating the CTFd flag — if we crash
             // between these steps, ctfd_flag_id stays NULL and cleanup skips delete_flag.
@@ -192,14 +205,14 @@ pub async fn provision(
             let flag_delivery = config["flag_delivery"].as_str().unwrap_or("env");
             let flag_file_path = config["flag_file_path"].as_str();
             let flag_service = config["flag_service"].as_str();
-            let project_name = container_name_hint.clone().unwrap_or_else(|| container_name(challenge_name));
+            let project_name = container_name_hint.clone().unwrap_or_else(|| container_name(challenge_name, team_id));
             let used_ports = crate::db::get_used_ports(db)?;
             let flag = generate_flag(config);
 
             // Build service_mappings and determine primary service + host_port.
             // Path A: service_ports is present — allocate ports per-service.
             // Path B: service_ports absent — wrap existing internal_ports into single-key map.
-            let (service_mappings, primary_service, host_port, all_port_mappings) =
+            let (service_mappings, primary_service, host_port, primary_protocol, all_port_mappings) =
                 if let Some(svc_ports_obj) = config["service_ports"].as_object() {
                     // Path A: multi-service port allocation
                     let total_count: usize = svc_ports_obj.values()
@@ -230,9 +243,9 @@ pub async fn provision(
                     } else {
                         map.keys().next().cloned().unwrap_or_else(|| "app".to_string())
                     };
-                    let hp = map.get(&primary).and_then(|v| v.first()).map(|(h, _, _)| *h)
+                    let (hp, proto) = map.get(&primary).and_then(|v| v.first()).map(|(h, _, p)| (*h, p.clone()))
                         .ok_or_else(|| anyhow!("service_ports: primary service '{}' has no ports", primary))?;
-                    (map, primary, hp, all_pairs)
+                    (map, primary, hp, proto, all_pairs)
                 } else {
                     // Path B: single-service, existing behavior
                     let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
@@ -241,10 +254,11 @@ pub async fn provision(
                         .map(|(&h, (i, proto))| (h, *i, proto.clone()))
                         .collect();
                     let hp = host_ports[0];
+                    let proto = port_mappings[0].2.clone();
                     let svc_key = if compose_service.is_empty() { "app" } else { compose_service };
                     let mut map = std::collections::HashMap::new();
                     map.insert(svc_key.to_string(), port_mappings.clone());
-                    (map, svc_key.to_string(), hp, port_mappings)
+                    (map, svc_key.to_string(), hp, proto, port_mappings)
                 };
 
             let (_, project) = compose::up(
@@ -261,6 +275,7 @@ pub async fn provision(
 
             let extra_ports = build_extra_ports_json(&all_port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
+            let connection = effective_connection_type(&connection, &primary_protocol);
 
             // Write instance to SQLite before creating the CTFd flag — if we crash
             // between these steps, ctfd_flag_id stays NULL and cleanup skips delete_flag.
@@ -280,7 +295,7 @@ pub async fn provision(
         }
         "lxc" => {
             let lxc_image = config["lxc_image"].as_str().unwrap_or("");
-            let cname = container_name(challenge_name);
+            let cname = container_name(challenge_name, team_id);
             let used_ports = crate::db::get_used_ports(db)?;
             let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
             let port_mappings: Vec<(u16, u32, String)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, (i, proto))| (h, *i, proto.clone())).collect();
@@ -290,6 +305,7 @@ pub async fn provision(
 
             let extra_ports = build_extra_ports_json(&port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
+            let connection = effective_connection_type(&connection, &port_mappings[0].2);
 
             // Write instance to SQLite before creating the CTFd flag — if we crash
             // between these steps, ctfd_flag_id stays NULL and cleanup skips delete_flag.
@@ -309,7 +325,7 @@ pub async fn provision(
         }
         "vagrant" => {
             let vagrantfile = config["vagrantfile"].as_str().unwrap_or("");
-            let vm_name = container_name(challenge_name);
+            let vm_name = container_name(challenge_name, team_id);
             let used_ports = crate::db::get_used_ports(db)?;
             let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
             let port_mappings: Vec<(u16, u32, String)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, (i, proto))| (h, *i, proto.clone())).collect();
@@ -317,6 +333,7 @@ pub async fn provision(
             let (_, vm_id) = vagrant::up(vagrantfile, &vm_name, &port_mappings).await?;
             let extra_ports = build_extra_ports_json(&port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
+            let connection = effective_connection_type(&connection, &port_mappings[0].2);
             crate::db::insert_instance(
                 db, challenge_name, team_id, user_id, &vm_id,
                 public_host, host_port as i64, &connection, &expires_at,
