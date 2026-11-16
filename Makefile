@@ -16,6 +16,7 @@
 
 BINARY_A  := nervctf
 BINARY_B  := remote-monitor
+BINARY_C  := nervctf-proxy
 
 NIX := nix develop .\# --command
 
@@ -47,21 +48,23 @@ release-nix: ## [Nix] Native release build — both binaries, no cross
 
 # ── Linux (both binaries) ─────────────────────────────────────────────────────
 
-release-linux: ## x86_64 Linux GNU — both binaries
+release-linux: ## x86_64 Linux GNU — all three binaries
 	$(NIX) cargo build --release --target x86_64-unknown-linux-gnu
 	@mkdir -p dist
 	cp target/x86_64-unknown-linux-gnu/release/$(BINARY_A) dist/$(BINARY_A)-linux-x86_64
 	cp target/x86_64-unknown-linux-gnu/release/$(BINARY_B) dist/$(BINARY_B)-linux-x86_64
-	@upx --lzma dist/$(BINARY_A)-linux-x86_64 dist/$(BINARY_B)-linux-x86_64 2>/dev/null || true
-	@echo "→ dist/$(BINARY_A)-linux-x86_64  dist/$(BINARY_B)-linux-x86_64"
+	cp target/x86_64-unknown-linux-gnu/release/$(BINARY_C) dist/$(BINARY_C)-linux-x86_64
+	@upx --lzma dist/$(BINARY_A)-linux-x86_64 dist/$(BINARY_B)-linux-x86_64 dist/$(BINARY_C)-linux-x86_64 2>/dev/null || true
+	@echo "→ dist/$(BINARY_A)-linux-x86_64  dist/$(BINARY_B)-linux-x86_64  dist/$(BINARY_C)-linux-x86_64"
 
-release-musl: ## x86_64 Linux musl static — both binaries
+release-musl: ## x86_64 Linux musl static — all three binaries
 	$(NIX) cargo build --release --target x86_64-unknown-linux-musl
 	@mkdir -p dist
 	cp target/x86_64-unknown-linux-musl/release/$(BINARY_A) dist/$(BINARY_A)-linux-x86_64-static
 	cp target/x86_64-unknown-linux-musl/release/$(BINARY_B) dist/$(BINARY_B)-linux-x86_64-static
-	@upx --lzma dist/$(BINARY_A)-linux-x86_64-static dist/$(BINARY_B)-linux-x86_64-static 2>/dev/null || true
-	@echo "→ dist/$(BINARY_A)-linux-x86_64-static  dist/$(BINARY_B)-linux-x86_64-static"
+	cp target/x86_64-unknown-linux-musl/release/$(BINARY_C) dist/$(BINARY_C)-linux-x86_64-static
+	@upx --lzma dist/$(BINARY_A)-linux-x86_64-static dist/$(BINARY_B)-linux-x86_64-static dist/$(BINARY_C)-linux-x86_64-static 2>/dev/null || true
+	@echo "→ dist/$(BINARY_A)-linux-x86_64-static  dist/$(BINARY_B)-linux-x86_64-static  dist/$(BINARY_C)-linux-x86_64-static"
 
 # ── ARM (nervctf CLI only — remote-monitor is x86_64 Linux only) ──────────────
 
