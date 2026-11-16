@@ -82,6 +82,11 @@ struct AppState {
     /// When set, all Docker/compose commands are executed on the runner via SSH
     /// instead of the local Docker daemon.
     runner_ssh_target: Option<String>,
+    /// Loki push endpoint for `log_proxy`-enabled `connection: http` instances
+    /// (`http://127.0.0.1:3100/loki/api/v1/push` in both single- and split-machine
+    /// mode — see docker.rs::loki_log_args and the Ansible playbooks for how
+    /// split-machine mode makes that loopback address reach the primary host's Loki).
+    loki_url: Option<String>,
     /// Limits concurrent docker/compose provision operations to prevent port-pick
     /// races and avoid overwhelming the Docker daemon socket.
     provision_sem: Arc<tokio::sync::Semaphore>,
@@ -119,6 +124,8 @@ async fn main() -> Result<()> {
                 .map(|h| h.trim_start_matches("ssh://").to_string())
         })
         .filter(|s| !s.is_empty());
+
+    let loki_url = env::var("LOKI_URL").ok().filter(|s| !s.is_empty());
 
     let ctfd_db_url = env::var("CTFD_DB_URL").expect("CTFD_DB_URL is required");
 
@@ -222,6 +229,7 @@ async fn main() -> Result<()> {
         ctfd_uploads_dir,
         ctfd_url,
         runner_ssh_target,
+        loki_url,
         provision_sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent_provisions)),
         max_instances_per_team,
     });
@@ -1176,6 +1184,7 @@ async fn instance_request_handler(
             &config, &state_bg.public_host, &state_bg.ctfd_pool,
             state_bg.runner_ssh_target.as_deref(),
             Some(container_name_bg),
+            state_bg.loki_url.as_deref(),
         ).await {
             Ok((host, port, conn, _exp)) => {
                 info!("provision_bg (player): done {}:{} ({}) for '{}' team {}", host, port, conn, challenge_name_bg, team_id);
@@ -1494,6 +1503,7 @@ async fn plugin_request_handler(
             &config, &state_bg.public_host, &state_bg.ctfd_pool,
             state_bg.runner_ssh_target.as_deref(),
             Some(container_name_bg),
+            state_bg.loki_url.as_deref(),
         ).await {
             Ok((host, port, conn, _exp)) => {
                 info!("provision_bg: done {}:{} ({}) for '{}' team {}", host, port, conn, challenge_name_bg, team_id_bg);

@@ -9,6 +9,23 @@ use tokio::io::AsyncWriteExt as _;
 
 use super::ssh;
 
+/// `docker run` flags that switch the log-proxy sidecar's logging driver from the default
+/// `json-file` to the `loki` Docker logging-driver plugin, shipping each JSON access-log
+/// line straight to Loki with team/challenge labels attached for Grafana to query. Requires
+/// `docker plugin install grafana/loki-docker-driver` on whichever host actually runs this
+/// container (the primary host in single-machine mode, the runner in split-machine mode —
+/// see the Ansible playbooks).
+pub fn loki_log_args(loki_url: &str, team_id: i64, challenge_name: &str) -> Vec<String> {
+    vec![
+        "--log-driver".to_string(),
+        "loki".to_string(),
+        "--log-opt".to_string(),
+        format!("loki-url={}", loki_url),
+        "--log-opt".to_string(),
+        format!("loki-external-labels=team_id={},challenge={}", team_id, challenge_name),
+    ]
+}
+
 /// Find a free TCP port in the ephemeral range, avoiding ports already used by running instances.
 ///
 /// Port availability is checked against the DB, not via bind(), because the monitor runs inside
@@ -147,6 +164,13 @@ pub async fn write_flag_file(flag_host_path: &str, flag_value: &str, runner_ssh:
 /// `port_mappings` — list of `(host_port, internal_port)` pairs; each becomes a
 /// `-p host:internal` flag.  First entry is the primary port shown to players.
 /// `volumes` — list of `(host_path, container_path)` bind mounts added as `-v …:…:ro`.
+/// `network` — when set, attaches the container to this user-defined bridge network
+///             instead of the default bridge, so sibling containers (e.g. an
+///             HTTP-proxy sidecar) can reach it by container name via Docker's
+///             embedded DNS. Used for `connection: http` instances (see
+///             `create_network`/`remove_network`).
+/// `extra_args` — additional raw `docker run` flags inserted before the image tag
+///                (e.g. `--log-driver=loki ...` for the proxy sidecar).
 pub async fn run_container(
     image_tag: &str,
     container_name: &str,
@@ -154,6 +178,8 @@ pub async fn run_container(
     command: Option<&str>,
     env_vars: &[(String, String)],
     volumes: &[(String, String)],
+    network: Option<&str>,
+    extra_args: &[String],
     runner_ssh: Option<&str>,
 ) -> Result<String> {
     let mut docker_args = vec![
@@ -163,6 +189,11 @@ pub async fn run_container(
         container_name.to_string(),
         "--restart=unless-stopped".to_string(),
     ];
+    if let Some(net) = network {
+        docker_args.push("--network".to_string());
+        docker_args.push(net.to_string());
+    }
+    docker_args.extend_from_slice(extra_args);
     for (hp, ip, proto) in port_mappings {
         docker_args.push("-p".to_string());
         let spec = if proto == "udp" {
@@ -210,6 +241,54 @@ pub async fn run_container(
     Ok(container_name.to_string())
 }
 
+/// Deterministic per-instance network name for an HTTP-proxied instance, derived from
+/// the app container's name so cleanup needs no extra DB state.
+pub fn proxy_network_name(container_name: &str) -> String {
+    format!("{}-net", container_name)
+}
+
+/// Deterministic sidecar proxy container name for an HTTP-proxied instance.
+pub fn proxy_container_name(container_name: &str) -> String {
+    format!("{}-proxy", container_name)
+}
+
+/// Create a user-defined bridge network for one instance, so the app container and
+/// its HTTP-proxy sidecar can reach each other by name. Best-effort: only used for
+/// `connection: http` docker-backend instances.
+pub async fn create_network(name: &str, runner_ssh: Option<&str>) -> Result<()> {
+    let cmd = format!("docker network create '{}'", name);
+    let output = if let Some(target) = runner_ssh {
+        ssh_output(target, &cmd).await
+            .map_err(|e| anyhow!("ssh docker network create failed to spawn: {}", e))?
+    } else {
+        tokio::process::Command::new("docker")
+            .args(["network", "create", name])
+            .output()
+            .await
+            .map_err(|e| anyhow!("docker network create failed: {}", e))?
+    };
+    if !output.status.success() {
+        return Err(anyhow!(
+            "docker network create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Remove a per-instance network. Best-effort — safe to call even if it never
+/// existed (non-http instances) or still has containers attached mid-teardown.
+pub async fn remove_network(name: &str, runner_ssh: Option<&str>) {
+    if let Some(target) = runner_ssh {
+        let _ = ssh_output(target, &format!("docker network rm '{}'", name)).await;
+    } else {
+        let _ = tokio::process::Command::new("docker")
+            .args(["network", "rm", name])
+            .output()
+            .await;
+    }
+}
+
 /// Stop and remove a Docker container, and clean up any flag file written for it.
 ///
 /// `container_id` may be a Docker hex ID or a container name (the latter is stored
@@ -225,6 +304,20 @@ pub async fn remove_container(container_id: &str, runner_ssh: Option<&str>) -> R
     } else {
         let _ = std::fs::remove_file(&flag_path);
     }
+
+    // Best-effort HTTP-proxy sidecar cleanup. No-op for instances that never had one
+    // (names derived deterministically — see `proxy_container_name`/`proxy_network_name`
+    // — so there's no extra DB state to track whether a given instance used a proxy).
+    let proxy_name = proxy_container_name(container_id);
+    if let Some(target) = runner_ssh {
+        let _ = ssh_output(target, &format!("docker rm -f '{}'", proxy_name)).await;
+    } else {
+        let _ = tokio::process::Command::new("docker")
+            .args(["rm", "-f", &proxy_name])
+            .output()
+            .await;
+    }
+    remove_network(&proxy_network_name(container_id), runner_ssh).await;
 
     if let Some(target) = runner_ssh {
         // Stop + remove on runner

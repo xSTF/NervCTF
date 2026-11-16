@@ -520,9 +520,9 @@
       var rowClass = isSolved ? ' class="row-solved"' : '';
       var stopCall = 'stopInstance(' + JSON.stringify(r.challenge_name) + ',' + Number(r.team_id) + ')';
       var stopAttr = stopCall.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-      var actionCell = isSolved
+      var actionCell = (isSolved
         ? '<span class="badge-solved">Solved</span>'
-        : '<button class="btn-stop" onclick="' + stopAttr + '">Stop</button>';
+        : '<button class="btn-stop" onclick="' + stopAttr + '">Stop</button>');
       html += '<tr' + rowClass + '>' +
         '<td>' + linkChallenge(r.challenge_name) + '</td>' +
         '<td>' + linkTeam(r.team_id, r.team_name) + '</td>' +

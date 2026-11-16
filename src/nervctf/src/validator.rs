@@ -322,6 +322,13 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                             ));
                         }
                     }
+                    if inst.log_proxy && inst.connection != "http" {
+                        issues.push(Issue::warn(
+                            name,
+                            "instance.log_proxy",
+                            "set but connection is not 'http' — log_proxy only applies to HTTP instances and has no effect here; raw `docker logs` are already available for any instance from the admin Traffic view",
+                        ));
+                    }
                     // timeout_minutes: 0 means instances would expire instantly
                     if inst.timeout_minutes == Some(0) {
                         issues.push(Issue::warn(name, "instance.timeout_minutes", "set to 0 — instances will expire immediately; omit to allow no timeout"));

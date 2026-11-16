@@ -89,6 +89,9 @@ instance:
 
   connection: nc              # nc | http | ssh — ignored for display when the primary
                               # port is UDP: players always see 'nc -u host port' then.
+  log_proxy: false            # http only. Opt-in traffic-logging sidecar — see
+                              # "HTTP traffic logging" below before enabling; it can
+                              # break WebSocket/streaming/raw-HTTP-semantics challenges.
   command: null               # override the container entrypoint or CMD
   timeout_minutes: 45
   max_renewals: 3
@@ -390,3 +393,55 @@ The cleanup path is null-safe: every call site in `main.rs` that reads `ctfd_fla
 The monitor serves a small HTML page at `GET /instance/<challenge_name>` where players enter their CTFd API token and use the Fetch, Extend, and Terminate buttons.
 
 The `nervctf_instance` plugin also adds a panel inside the CTFd challenge page that calls `/api/v1/containers/*`, so players can manage the instance without leaving CTFd.
+
+---
+
+## HTTP traffic logging (`log_proxy`)
+
+`log_proxy: true` in the `instance:` block opts one `connection: http` challenge into an
+HTTP-proxy sidecar (`nervctf-proxy`) so admins can review what players actually sent —
+useful for flag-sharing and exploit-reuse detection. **Off by default, and only meaningful
+with `connection: http`** — set it on a specific challenge, not globally.
+
+**Do not enable `log_proxy` for a challenge whose puzzle is HTTP behavior itself.** The
+sidecar re-terminates HTTP: it fully buffers request/response bodies in memory (no size
+cap — organizers should expect proportional memory use on large uploads), has no
+WebSocket/`Upgrade` handling, and normalizes raw protocol quirks through its own
+client/server stack. This will alter or break challenges built around WebSockets,
+SSE/long-polling, HTTP request smuggling, raw socket timing, or non-standard methods. For
+everything else — typical web apps (Flask/Node/etc.) — it's a safe, zero-code-change way to
+see exactly what was sent.
+
+**Docker backend**: when enabled, the app container joins a per-instance bridge network and
+is not published directly; the sidecar is published on the player-facing host port instead
+and forwards to the app by container name. **Compose backend**: the primary service's
+`ports:` entry is replaced by a `proxy:` service in the per-instance override, forwarding to
+the primary service by compose's built-in service-name DNS. Multi-port http instances are
+proxied on their primary port only; any additional ports stay published directly. When
+`log_proxy` is unset (or `connection` isn't `http`), none of this applies — behavior is
+identical to a plain instance with no sidecar at all.
+
+The sidecar logs one JSON line per request/response (method, path, headers, body) to its
+own stdout, tagged with `team_id`/`challenge` labels, and ships it straight to Loki via
+Docker's `loki` logging-driver plugin — nothing is read from disk on demand. Request/response
+bodies are capped at 2 KB per log line (`req_body_truncated`/`resp_body_truncated` flags mark
+when a body was cut); full-body-dependent challenges should not enable `log_proxy` in the
+first place (see the warning above).
+
+**Viewing it**: open Grafana (`http://<host>:3000`, see `nervctf setup`'s printed access info)
+and go to the **NervCTF Player Traffic** dashboard. It's templated on `$challenge` and
+`$team_id` and renders each request as a table row (method/path/status/duration) parsed out of
+the JSON log line — expand a row's `Line` field for the full entry (headers, body preview).
+Non-`log_proxy` instances have nothing here; their output is whatever the app itself printed,
+visible only via plain `docker logs`/`docker compose logs` on the host.
+
+In split-machine mode, the runner host's Docker daemon (which does the actual Loki push, from
+its own network namespace) reaches Loki on the primary host over loopback through a
+persistent reverse SSH tunnel (`nervctf-loki-tunnel.service`, set up by `nervctf setup`) rather
+than a firewalled public port — Loki itself is never exposed beyond `127.0.0.1` on either host.
+
+Cleanup is unconditional and best-effort: `docker.rs::remove_container` always also tries to
+remove `<container_id>-proxy` and `<container_id>-net` (deterministic names, no extra DB
+state), which is a silent no-op for instances that never had a sidecar. The compose backend
+needs no equivalent — `docker compose down` already tears down every service in the
+project, proxy included.

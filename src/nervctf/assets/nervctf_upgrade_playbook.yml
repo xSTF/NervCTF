@@ -115,6 +115,352 @@
       become_user: "{{ docker_user }}"
       when: monitor_binary is defined
 
+    # ── nervctf-proxy binary + Docker image (HTTP instance traffic-logging sidecar) ─
+    - name: Ensure nervctf-proxy directory exists
+      file:
+        path: "{{ ctfd_path }}/nervctf-proxy"
+        state: directory
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+      when: proxy_binary is defined
+
+    - name: Copy updated nervctf-proxy binary
+      copy:
+        src: "{{ proxy_binary }}"
+        dest: "{{ ctfd_path }}/nervctf-proxy/nervctf-proxy"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+      when: proxy_binary is defined
+
+    # NOTE: This Dockerfile is duplicated in nervctf_playbook.yml — keep them in sync.
+    - name: Write nervctf-proxy Dockerfile
+      copy:
+        content: |
+          FROM debian:bookworm-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+              rm -rf /var/lib/apt/lists/*
+          COPY nervctf-proxy /usr/local/bin/nervctf-proxy
+          ENTRYPOINT ["/usr/local/bin/nervctf-proxy"]
+        dest: "{{ ctfd_path }}/nervctf-proxy/Dockerfile"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+      when: proxy_binary is defined
+
+    - name: Rebuild nervctf-proxy Docker image
+      command: docker build -t nervctf-proxy:latest {{ ctfd_path }}/nervctf-proxy
+      become_user: "{{ docker_user }}"
+      when: proxy_binary is defined
+
+    # ── Grafana/Prometheus/Loki data directories (host resource monitoring +
+    #    opt-in log_proxy player-traffic logging) ────────────────────────────────
+    - name: Ensure Grafana/Prometheus/Loki data directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0777"
+      loop:
+        - "{{ ctfd_path }}/grafana/data"
+        - "{{ ctfd_path }}/prometheus/data"
+        - "{{ ctfd_path }}/loki/data"
+
+    - name: Write Loki config
+      copy:
+        content: |
+          auth_enabled: false
+          server:
+            http_listen_port: 3100
+          common:
+            path_prefix: /loki
+            storage:
+              filesystem:
+                chunks_directory: /loki/chunks
+                rules_directory: /loki/rules
+            replication_factor: 1
+            ring:
+              kvstore:
+                store: inmemory
+          schema_config:
+            configs:
+              - from: 2020-10-24
+                store: tsdb
+                object_store: filesystem
+                schema: v13
+                index:
+                  prefix: index_
+                  period: 24h
+          limits_config:
+            max_line_size: 256KB
+            ingestion_rate_mb: 16
+            ingestion_burst_size_mb: 32
+        dest: "{{ ctfd_path }}/loki/loki-config.yaml"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    # ── Loki Docker logging-driver plugin ───────────────────────────────────────
+    # Required on whichever host actually runs the log-proxy sidecar's `docker run`/
+    # `docker compose up` with `--log-driver=loki`: the primary host in single-machine
+    # mode (this play), or the runner host in split-machine mode (separate play below).
+    - name: Check if Loki Docker logging-driver plugin is installed
+      when: runner_ip is not defined
+      command: "{% raw %}docker plugin ls --format '{{.Name}}'{% endraw %}"
+      register: docker_plugins_primary
+      changed_when: false
+      failed_when: false
+
+    - name: Install Loki Docker logging-driver plugin
+      when: runner_ip is not defined and 'loki:latest' not in docker_plugins_primary.stdout
+      command: docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions
+      register: loki_plugin_install_primary
+      failed_when: loki_plugin_install_primary.rc != 0 and 'already exist' not in loki_plugin_install_primary.stderr
+
+    - name: Ensure Prometheus config directory exists
+      file:
+        path: "{{ ctfd_path }}/prometheus"
+        state: directory
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+
+    - name: Write Prometheus scrape config
+      copy:
+        content: |
+          global:
+            scrape_interval: 15s
+          scrape_configs:
+            - job_name: node
+              static_configs:
+                - targets: ["node-exporter:9100"]
+        dest: "{{ ctfd_path }}/prometheus/prometheus.yml"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    - name: Ensure Grafana provisioning directory exists
+      file:
+        path: "{{ ctfd_path }}/grafana/provisioning/datasources"
+        state: directory
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+
+    - name: Write Grafana Prometheus datasource
+      copy:
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              uid: prometheus
+              type: prometheus
+              access: proxy
+              url: http://prometheus:9090
+              isDefault: true
+        dest: "{{ ctfd_path }}/grafana/provisioning/datasources/prometheus.yml"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    - name: Write Grafana Loki datasource
+      copy:
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Loki
+              uid: loki
+              type: loki
+              access: proxy
+              url: http://loki:3100
+        dest: "{{ ctfd_path }}/grafana/provisioning/datasources/loki.yml"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    # ── Grafana dashboards (shipped, not left for the operator to build) ───────
+    - name: Ensure Grafana dashboard provisioning directory exists
+      file:
+        path: "{{ ctfd_path }}/grafana/provisioning/dashboards"
+        state: directory
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+
+    - name: Write Grafana dashboard provider config
+      copy:
+        content: |
+          apiVersion: 1
+          providers:
+            - name: NervCTF
+              orgId: 1
+              folder: ""
+              type: file
+              disableDeletion: true
+              updateIntervalSeconds: 30
+              allowUiUpdates: false
+              options:
+                path: /etc/grafana/provisioning/dashboards
+        dest: "{{ ctfd_path }}/grafana/provisioning/dashboards/dashboards.yml"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    - name: Write NervCTF host-resources dashboard
+      copy:
+        content: |
+          {
+            "title": "NervCTF Host Resources",
+            "uid": "nervctf-host-resources",
+            "schemaVersion": 39,
+            "editable": true,
+            "time": { "from": "now-1h", "to": "now" },
+            "refresh": "30s",
+            "panels": [
+              {
+                "id": 1,
+                "title": "CPU usage %",
+                "type": "timeseries",
+                "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "targets": [
+                  {
+                    "datasource": { "type": "prometheus", "uid": "prometheus" },
+                    "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+                    "legendFormat": "CPU"
+                  }
+                ]
+              },
+              {
+                "id": 2,
+                "title": "Memory usage %",
+                "type": "timeseries",
+                "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "targets": [
+                  {
+                    "datasource": { "type": "prometheus", "uid": "prometheus" },
+                    "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100",
+                    "legendFormat": "Memory"
+                  }
+                ]
+              },
+              {
+                "id": 3,
+                "title": "Disk usage % (root)",
+                "type": "timeseries",
+                "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "targets": [
+                  {
+                    "datasource": { "type": "prometheus", "uid": "prometheus" },
+                    "expr": "100 - ((node_filesystem_avail_bytes{mountpoint=\"/\", fstype!=\"tmpfs\"} / node_filesystem_size_bytes{mountpoint=\"/\", fstype!=\"tmpfs\"}) * 100)",
+                    "legendFormat": "Disk"
+                  }
+                ]
+              },
+              {
+                "id": 4,
+                "title": "Network I/O (bytes/s)",
+                "type": "timeseries",
+                "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "targets": [
+                  {
+                    "datasource": { "type": "prometheus", "uid": "prometheus" },
+                    "expr": "rate(node_network_receive_bytes_total{device!=\"lo\"}[5m])",
+                    "legendFormat": "RX {{ '{{device}}' }}"
+                  },
+                  {
+                    "datasource": { "type": "prometheus", "uid": "prometheus" },
+                    "expr": "rate(node_network_transmit_bytes_total{device!=\"lo\"}[5m])",
+                    "legendFormat": "TX {{ '{{device}}' }}"
+                  }
+                ]
+              }
+            ]
+          }
+        dest: "{{ ctfd_path }}/grafana/provisioning/dashboards/host-resources.json"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    # ── NervCTF Player Traffic dashboard (opt-in log_proxy challenges only) ─────
+    - name: Write NervCTF player-traffic dashboard
+      copy:
+        content: |
+          {
+            "title": "NervCTF Player Traffic",
+            "uid": "nervctf-player-traffic",
+            "schemaVersion": 39,
+            "editable": true,
+            "time": { "from": "now-1h", "to": "now" },
+            "refresh": "30s",
+            "templating": {
+              "list": [
+                {
+                  "name": "challenge",
+                  "type": "query",
+                  "datasource": { "type": "loki", "uid": "loki" },
+                  "query": "label_values(challenge)",
+                  "refresh": 2,
+                  "includeAll": true,
+                  "multi": true
+                },
+                {
+                  "name": "team_id",
+                  "type": "query",
+                  "datasource": { "type": "loki", "uid": "loki" },
+                  "query": "label_values(team_id)",
+                  "refresh": 2,
+                  "includeAll": true,
+                  "multi": true
+                }
+              ]
+            },
+            "panels": [
+              {
+                "id": 1,
+                "title": "Requests",
+                "type": "table",
+                "gridPos": { "h": 16, "w": 24, "x": 0, "y": 0 },
+                "datasource": { "type": "loki", "uid": "loki" },
+                "transformations": [
+                  {
+                    "id": "organize",
+                    "options": {
+                      "excludeByName": {
+                        "Time": false, "challenge": true, "team_id": true, "Line": true,
+                        "tsNs": true, "id": true, "labels": true,
+                        "req_headers": true, "resp_headers": true,
+                        "req_body_b64": true, "resp_body_b64": true,
+                        "req_body_len": true, "resp_body_len": true,
+                        "req_body_truncated": true, "resp_body_truncated": true,
+                        "ts_ms": true
+                      },
+                      "indexByName": { "Time": 0, "method": 1, "path": 2, "status": 3, "duration_ms": 4 },
+                      "renameByName": {
+                        "method": "Method", "path": "Path", "status": "Status",
+                        "duration_ms": "Duration (ms)"
+                      }
+                    }
+                  }
+                ],
+                "targets": [
+                  {
+                    "datasource": { "type": "loki", "uid": "loki" },
+                    "expr": "{challenge=~\"$challenge\", team_id=~\"$team_id\"} | json",
+                    "queryType": "range"
+                  }
+                ]
+              }
+            ]
+          }
+        dest: "{{ ctfd_path }}/grafana/provisioning/dashboards/player-traffic.json"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
     # ── docker-compose override (monitor service + CTFd env) ───────────────────
     # Re-write the override so config changes (monitor_port, max_concurrent_provisions,
     # max_instances_per_team, etc.) take effect without requiring a full re-setup.
@@ -223,6 +569,10 @@
                 - CHALLENGES_BASE_DIR={{ ctfd_path }}/remote-monitor/data/challenges
           {% endif %}
                 - CTFD_UPLOADS_DIR={{ ctfd_path }}/.data/CTFd/uploads
+                # Always loopback — see docker.rs::loki_log_args and the reverse
+                # SSH tunnel task below for why this is correct in split-machine
+                # mode too.
+                - LOKI_URL=http://127.0.0.1:3100/loki/api/v1/push
                 - MAX_CONCURRENT_PROVISIONS={{ max_concurrent_provisions }}
                 - MAX_INSTANCES_PER_TEAM={{ max_instances_per_team }}
           {% if ctfd_domain is defined and ctfd_domain %}
@@ -243,6 +593,76 @@
               ports:
                 - "{{ monitor_port }}:{{ monitor_port }}"
 
+            # Prometheus/node-exporter/Grafana: always-on host resource monitoring
+            # (CPU/RAM/disk/network for the CTFd host). node-exporter is reached only
+            # by Prometheus over the compose network, never published to the host.
+            prometheus:
+              image: prom/prometheus:latest
+              restart: unless-stopped
+              networks:
+                - default
+              volumes:
+                - {{ ctfd_path }}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+                - {{ ctfd_path }}/prometheus/data:/prometheus
+              # Loopback-only, unconditionally: Prometheus only scrapes node-exporter
+              # and is only read by Grafana — both always on this same host, over the
+              # compose network. No cross-host case needs port 9090 published beyond
+              # localhost.
+              ports:
+                - "127.0.0.1:9090:9090"
+
+            node-exporter:
+              image: prom/node-exporter:latest
+              restart: unless-stopped
+              networks:
+                - default
+              volumes:
+                - /proc:/host/proc:ro
+                - /sys:/host/sys:ro
+                - /:/rootfs:ro
+              command:
+                - --path.procfs=/host/proc
+                - --path.sysfs=/host/sys
+                - --path.rootfs=/rootfs
+                - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($|/)
+
+            # Loki: stores player-traffic JSON lines shipped by opt-in `log_proxy`
+            # sidecars. Loopback-only, unconditionally — see the primary playbook
+            # for the full rationale.
+            loki:
+              # Pinned, not :latest — see the primary playbook for why.
+              image: grafana/loki:2.9.10
+              restart: unless-stopped
+              networks:
+                - default
+              volumes:
+                - {{ ctfd_path }}/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+                - {{ ctfd_path }}/loki/data:/loki
+              ports:
+                - "127.0.0.1:3100:3100"
+
+            grafana:
+              image: grafana/grafana:latest
+              restart: unless-stopped
+              networks:
+                - default
+              environment:
+                - GF_SECURITY_ADMIN_USER=admin
+                - GF_SECURITY_ADMIN_PASSWORD={{ monitor_token }}
+                - GF_AUTH_ANONYMOUS_ENABLED=false
+              volumes:
+                - {{ ctfd_path }}/grafana/data:/var/lib/grafana
+                - {{ ctfd_path }}/grafana/provisioning:/etc/grafana/provisioning:ro
+              ports:
+          {% if runner_ip is defined %}
+                - "3000:3000"
+          {% else %}
+                - "127.0.0.1:3000:3000"
+          {% endif %}
+              depends_on:
+                - prometheus
+                - loki
+
           # Explicitly declare the networks used by remote-monitor so Docker Compose
           # correctly joins it to the existing project networks (not creating new ones).
           networks:
@@ -261,6 +681,16 @@
         chdir: "{{ ctfd_path }}"
       become_user: "{{ docker_user }}"
       when: monitor_binary is defined
+
+    # Only the monitoring stack — never recreate the whole stack just for this, so
+    # an upgrade that only touches these doesn't bounce the CTFd/nginx containers
+    # players are using. --remove-orphans also reaps containers for services no
+    # longer defined in the combined compose files.
+    - name: Apply Prometheus/node-exporter/Grafana/Loki (new image or config)
+      command:
+        cmd: docker compose up -d --force-recreate --remove-orphans prometheus node-exporter grafana loki
+        chdir: "{{ ctfd_path }}"
+      become_user: "{{ docker_user }}"
 
     # Recreate the whole stack so the override's environment is applied and
     # nginx re-resolves the ctfd container (a `restart` keeps both the old env
@@ -295,3 +725,69 @@
         name: "{{ runner_user | default(docker_user) }}"
         groups: docker
         append: yes
+
+    # ── Loki Docker logging-driver plugin (runner side) ────────────────────────
+    - name: Check if Loki Docker logging-driver plugin is installed on runner
+      when: runner_ip is defined
+      command: "{% raw %}docker plugin ls --format '{{.Name}}'{% endraw %}"
+      register: docker_plugins_runner
+      changed_when: false
+      failed_when: false
+
+    - name: Install Loki Docker logging-driver plugin on runner
+      when: runner_ip is defined and 'loki:latest' not in docker_plugins_runner.stdout
+      command: docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions
+      register: loki_plugin_install_runner
+      failed_when: loki_plugin_install_runner.rc != 0 and 'already exist' not in loki_plugin_install_runner.stderr
+
+# ── Reverse SSH tunnel: primary → runner (split-machine mode only) ────────────
+# See the primary playbook for the full rationale. Re-applied on every upgrade
+# in case the systemd unit or monitor_ssh_key path changed.
+- hosts: ctfd
+  become: yes
+  vars:
+    ansible_python_interpreter: auto_silent
+    docker_user: "{{ ansible_user }}"
+  tasks:
+    - name: Install autossh (split-machine Loki tunnel)
+      when: runner_ip is defined
+      apt:
+        name: autossh
+        state: present
+        update_cache: yes
+
+    - name: Write systemd unit for primary→runner Loki reverse tunnel
+      when: runner_ip is defined
+      copy:
+        content: |
+          [Unit]
+          Description=NervCTF: reverse-forward Loki (3100) to the runner over SSH
+          After=network-online.target docker.service
+          Wants=network-online.target
+
+          [Service]
+          Environment=AUTOSSH_GATETIME=0
+          ExecStart=/usr/bin/autossh -M 0 -N \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -i {{ ctfd_path }}/remote-monitor/monitor_ssh_key \
+            -R 3100:127.0.0.1:3100 \
+            {{ runner_user | default('docker') }}@{{ runner_resolved_ip | default(runner_ip) }}
+          Restart=always
+          RestartSec=5
+          User={{ docker_user }}
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/nervctf-loki-tunnel.service
+        mode: "0644"
+      register: loki_tunnel_unit
+
+    - name: Enable and (re)start the Loki reverse-tunnel service
+      when: runner_ip is defined
+      systemd:
+        name: nervctf-loki-tunnel
+        daemon_reload: "{{ loki_tunnel_unit.changed }}"
+        enabled: yes
+        state: "{{ 'restarted' if loki_tunnel_unit.changed else 'started' }}"

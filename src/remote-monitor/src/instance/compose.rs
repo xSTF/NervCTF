@@ -55,6 +55,17 @@ pub async fn compose_cmd() -> tokio::process::Command {
 ///                      file at `flag_file_path` inside `flag_service`
 /// `flag_file_path`   — absolute path inside the container (required for `"file"` mode)
 /// `flag_service`     — service that receives the flag file mount; defaults to `primary_service`
+/// `team_id`/`challenge_name` — passed to the proxy sidecar's env (`TEAM_ID`/`CHALLENGE_NAME`)
+///                      when `http_proxy` is true; unused otherwise.
+/// `http_proxy`       — when true (challenge opted in via `log_proxy: true` and
+///                      `connection: http`), the primary service is *not* published
+///                      directly; instead an `nervctf-proxy` sidecar is published on its
+///                      host port and forwards to the primary service by compose
+///                      service-name DNS, shipping each request/response to Loki for
+///                      the "NervCTF Player Traffic" Grafana dashboard
+///                      (see `docs/instance-challenges.md`).
+/// `loki_url`         — Loki push endpoint for the proxy sidecar's `--log-driver=loki`;
+///                      required when `http_proxy` is true, unused otherwise.
 /// `runner_ssh`       — override SSH target; falls back to `runner_target()` if `None`
 ///
 /// Returns `(primary_host_port, container_id_or_project)`.
@@ -67,6 +78,10 @@ pub async fn up(
     flag_delivery: &str,
     flag_file_path: Option<&str>,
     flag_service: Option<&str>,
+    team_id: i64,
+    challenge_name: &str,
+    http_proxy: bool,
+    loki_url: Option<&str>,
     runner_ssh: Option<&str>,
 ) -> Result<(u16, String)> {
     let svc_name = if primary_service.is_empty() { "app" } else { primary_service };
@@ -155,11 +170,15 @@ pub async fn up(
     // Helper closure — add image + optional ports/volumes for one service.
     // (Rust closures can't mutate `override_content` from within, so we inline the logic.)
     macro_rules! add_service {
-        ($svc:expr) => {{
+        ($svc:expr) => {
+            add_service!($svc, false)
+        };
+        ($svc:expr, $skip_ports:expr) => {{
             let svc: &str = $svc;
+            let skip_ports: bool = $skip_ports;
             override_content.push_str(&format!("  {}:\n    image: {}-{}\n", svc, challenge_dir_name, svc));
             if let Some(mappings) = service_mappings.get(svc) {
-                if !mappings.is_empty() {
+                if !mappings.is_empty() && !skip_ports {
                     override_content.push_str("    ports:\n");
                     for (hp, ip, proto) in mappings {
                         let spec = if proto == "udp" {
@@ -182,8 +201,10 @@ pub async fn up(
         }};
     }
 
-    // Main service first so any appended lines land in the right block.
-    add_service!(svc_name);
+    // Main service first so any appended lines land in the right block. When an
+    // HTTP-proxy sidecar fronts this instance, the primary service is not published
+    // directly — only the sidecar (added below) is.
+    add_service!(svc_name, http_proxy);
 
     // All other pre-built services.
     for svc in &pre_built_services {
@@ -203,6 +224,27 @@ pub async fn up(
                 tsvc_str, hp, cp
             ));
         }
+    }
+
+    // HTTP-proxy sidecar: published on the primary service's host port, forwarding to
+    // the primary service by compose's built-in service-name DNS (the same mechanism
+    // `compose_service` already relies on for inter-service traffic).
+    if http_proxy {
+        let primary_internal_port = service_mappings
+            .get(svc_name)
+            .and_then(|v| v.first())
+            .map(|(_, ip, _)| *ip)
+            .unwrap_or(80);
+        // Per-instance compose projects are never joined to the main ctfd stack's
+        // network, so the `loki` container-name DNS used by Grafana's datasource
+        // doesn't resolve here — this always goes over loopback instead (reachable
+        // directly in single-machine mode, or via the primary→runner reverse SSH
+        // tunnel in split-machine mode; see the Ansible playbooks).
+        let loki = loki_url.unwrap_or("http://127.0.0.1:3100/loki/api/v1/push");
+        override_content.push_str(&format!(
+            "  proxy:\n    image: nervctf-proxy:latest\n    restart: unless-stopped\n    ports:\n      - \"{}:8080\"\n    environment:\n      - UPSTREAM=http://{}:{}\n      - TEAM_ID={}\n      - CHALLENGE_NAME={}\n      - LISTEN_PORT=8080\n    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"team_id={},challenge={}\"\n",
+            host_port, svc_name, primary_internal_port, team_id, challenge_name, loki, team_id, challenge_name,
+        ));
     }
 
     let flag_file_content: Option<(String, Vec<u8>)> =

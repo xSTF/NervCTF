@@ -158,6 +158,52 @@ fn find_monitor_binary() -> Option<PathBuf> {
     None
 }
 
+fn find_proxy_binary() -> Option<PathBuf> {
+    // Names to search for, in preference order (musl static first — no interpreter issues)
+    const NAMES: &[&str] = &[
+        "nervctf-proxy",
+        "nervctf-proxy-linux-x86_64-static",
+        "nervctf-proxy-linux-x86_64",
+        "nervctf-proxy-linux-aarch64-static",
+        "nervctf-proxy-linux-aarch64",
+    ];
+
+    // 1. Next to the running nervctf exe (covers dist/ when user runs dist/nervctf-*)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in NAMES {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    // 2. Cargo build output (covers dev workflow where user runs from workspace root)
+    if let Some(root) = find_workspace_root() {
+        let targets = [
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "",
+        ];
+        for profile in &["release", "debug"] {
+            for target in &targets {
+                let candidate = if target.is_empty() {
+                    root.join("target").join(profile).join("nervctf-proxy")
+                } else {
+                    root.join("target").join(target).join(profile).join("nervctf-proxy")
+                };
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn find_plugin_src() -> Option<PathBuf> {
     // Prefer an on-disk copy (dev checkout, or a user-supplied copy next to the
     // binary) so it can be edited without rebuilding.
@@ -644,6 +690,17 @@ pub fn run_setup() -> Result<()> {
         None => println!("  [!] CTFd plugin not found -- plugin will not be deployed."),
     }
 
+    // ── Find nervctf-proxy binary (HTTP traffic-logging sidecar) ──────────────
+    let proxy_binary = find_proxy_binary();
+    match &proxy_binary {
+        Some(p) => println!("  Found nervctf-proxy binary: {}", p.display()),
+        None => println!(
+            "  [!] nervctf-proxy binary not found -- connection: http instances will run \
+             without the traffic-logging sidecar. Build it with:\n\
+             cargo build --release --target x86_64-unknown-linux-musl -p nervctf-proxy"
+        ),
+    }
+
     // ── Build ansible extra-vars ───────────────────────────────────────────────
     let mut evars: Vec<String> = vec![
         format!("ssh_pubkey={}", ssh_pubkey),
@@ -658,6 +715,9 @@ pub fn run_setup() -> Result<()> {
     }
     if let Some(ref plugin) = plugin_src {
         evars.push(format!("plugin_src={}", plugin.display()));
+    }
+    if let Some(ref bin) = proxy_binary {
+        evars.push(format!("proxy_binary={}", bin.display()));
     }
     if let Some(ref rip) = runner_ip {
         evars.push(format!("runner_ip={}", rip));
@@ -702,6 +762,27 @@ pub fn run_setup() -> Result<()> {
         println!("   cargo build --release --target x86_64-unknown-linux-musl -p remote-monitor");
         println!("   Then re-run `nervctf setup` to deploy it.");
     }
+    if proxy_binary.is_none() {
+        println!("\n[!] remember to build and deploy nervctf-proxy for HTTP instance traffic logging:");
+        println!("   cargo build --release --target x86_64-unknown-linux-musl -p nervctf-proxy");
+        println!("   Then re-run `nervctf setup` to deploy it.");
+    }
+    // Grafana (host resource monitoring via Prometheus/node-exporter) is always installed.
+    if runner_ip.is_some() {
+        println!(
+            "  Grafana:      http://{}:3000 (user: admin, password: {})",
+            monitor_ip, monitor_token
+        );
+        println!("  [!] split-machine mode: Grafana is bound to all interfaces on the");
+        println!("      CTFd host — firewall port 3000 yourself.");
+    } else {
+        println!("  Grafana:      loopback-only — tunnel in with:");
+        println!("    ssh -L 3000:localhost:3000 {}@{}", monitor_user, monitor_ip);
+        println!("    then open http://localhost:3000 (user: admin, password: {})", monitor_token);
+    }
+    println!(
+        "  Player traffic for `log_proxy: true` HTTP challenges: Grafana → \"NervCTF Player Traffic\" dashboard."
+    );
     Ok(())
 }
 
@@ -833,6 +914,7 @@ pub fn run_upgrade() -> Result<()> {
     // ── Find local artifacts ───────────────────────────────────────────────────
     let monitor_binary = find_monitor_binary();
     let plugin_src = find_plugin_src();
+    let proxy_binary = find_proxy_binary();
 
     if monitor_binary.is_none() && plugin_src.is_none() {
         return Err(anyhow!(
@@ -851,6 +933,10 @@ pub fn run_upgrade() -> Result<()> {
     match &plugin_src {
         Some(p) => println!("CTFd plugin:    {}", p.display()),
         None     => println!("[!] CTFd plugin not found — skipping plugin upgrade"),
+    }
+    match &proxy_binary {
+        Some(p) => println!("Proxy binary:   {}", p.display()),
+        None     => println!("[!] nervctf-proxy binary not found — skipping traffic-logging sidecar upgrade"),
     }
 
     println!();
@@ -875,6 +961,9 @@ pub fn run_upgrade() -> Result<()> {
     }
     if let Some(ref plugin) = plugin_src {
         evars.push(format!("plugin_src={}", plugin.display()));
+    }
+    if let Some(ref bin) = proxy_binary {
+        evars.push(format!("proxy_binary={}", bin.display()));
     }
     // Pass runner vars so the upgrade playbook can write the correct
     // RUNNER_SSH_TARGET / CHALLENGES_BASE_DIR into the docker-compose override.
@@ -926,6 +1015,22 @@ pub fn run_upgrade() -> Result<()> {
     println!("\nUpgrade complete!");
     println!("  Admin Panel:  {}/admin", monitor_url);
     println!("  Token:        {}", upgrade_token);
+    let runner_configured = config.runner_ip.as_deref().is_some_and(|s| !s.is_empty());
+    if runner_configured {
+        println!(
+            "  Grafana:      http://{}:3000 (user: admin, password: {})",
+            monitor_ip, upgrade_token
+        );
+        println!("  [!] split-machine mode: Grafana is bound to all interfaces on the");
+        println!("      CTFd host — firewall port 3000 yourself.");
+    } else {
+        println!("  Grafana:      loopback-only — tunnel in with:");
+        println!("    ssh -L 3000:localhost:3000 {}@{}", monitor_user, monitor_ip);
+        println!("    then open http://localhost:3000 (user: admin, password: {})", upgrade_token);
+    }
+    println!(
+        "  Player traffic for `log_proxy: true` HTTP challenges: Grafana → \"NervCTF Player Traffic\" dashboard."
+    );
     Ok(())
 }
 

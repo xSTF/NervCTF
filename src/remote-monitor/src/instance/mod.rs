@@ -102,6 +102,8 @@ pub async fn provision(
     // Pre-generated name from handler so it matches the provisioning stub's container_id,
     // preventing the orphan checker from killing the project before the DB is updated.
     container_name_hint: Option<String>,
+    // Loki push endpoint for `log_proxy`-enabled `connection: http` instances.
+    loki_url: Option<&str>,
 ) -> Result<(String, u16, String, String)> {
     let backend = config["backend"].as_str().unwrap_or("docker");
     let connection = config["connection"].as_str().unwrap_or("nc").to_string();
@@ -155,15 +157,60 @@ pub async fn provision(
                 }
             }
 
+            // `connection: http` instances with `log_proxy: true` get an HTTP-proxy
+            // sidecar in front of them (see docs/instance-challenges.md) so admins can
+            // review player traffic on demand. Opt-in only — re-terminating HTTP through
+            // our own proxy is a real risk for challenges whose puzzle is HTTP behavior
+            // itself (WebSockets, streaming, raw protocol quirks), so it's off by default.
+            // The app container joins a dedicated per-instance network and is not
+            // published directly; the sidecar is published on `host_port` instead and
+            // forwards to the app by container name.
+            let log_proxy = connection == "http" && config["log_proxy"].as_bool().unwrap_or(false);
+            let proxy_net = log_proxy.then(|| docker::proxy_network_name(&cname));
+            if let Some(net) = &proxy_net {
+                docker::create_network(net, runner_ssh).await?;
+            }
+
+            // Only the primary port is proxied; any additional ports (multi-port http
+            // instances, an edge case the schema allows but doesn't exercise today) are
+            // still published directly on the app container, same as non-proxied instances.
+            let app_port_mappings: &[(u16, u32, String)] =
+                if log_proxy { &port_mappings[1..] } else { &port_mappings };
+
             let container_id = docker::run_container(
                 &image_tag,
                 &cname,
-                &port_mappings,
+                app_port_mappings,
                 command,
                 &env_vars,
                 &volumes,
+                proxy_net.as_deref(),
+                &[],
                 runner_ssh,
             ).await?;
+
+            if log_proxy {
+                let proxy_name = docker::proxy_container_name(&cname);
+                let proxy_env = vec![
+                    ("UPSTREAM".to_string(), format!("http://{}:{}", cname, internal_ports[0].0)),
+                    ("TEAM_ID".to_string(), team_id.to_string()),
+                    ("CHALLENGE_NAME".to_string(), challenge_name.to_string()),
+                    ("LISTEN_PORT".to_string(), "8080".to_string()),
+                ];
+                let proxy_port_mappings = vec![(host_port, 8080u32, "tcp".to_string())];
+                let loki = loki_url.unwrap_or("http://127.0.0.1:3100/loki/api/v1/push");
+                docker::run_container(
+                    "nervctf-proxy:latest",
+                    &proxy_name,
+                    &proxy_port_mappings,
+                    None,
+                    &proxy_env,
+                    &[],
+                    proxy_net.as_deref(),
+                    &docker::loki_log_args(loki, team_id, challenge_name),
+                    runner_ssh,
+                ).await?;
+            }
 
             let extra_ports = build_extra_ports_json(&port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
@@ -261,6 +308,7 @@ pub async fn provision(
                     (map, svc_key.to_string(), hp, proto, port_mappings)
                 };
 
+            let log_proxy = connection == "http" && config["log_proxy"].as_bool().unwrap_or(false);
             let (_, project) = compose::up(
                 &compose_path,
                 &project_name,
@@ -270,6 +318,10 @@ pub async fn provision(
                 flag_delivery,
                 flag_file_path,
                 flag_service,
+                team_id,
+                challenge_name,
+                log_proxy,
+                loki_url,
                 runner_ssh,
             ).await?;
 

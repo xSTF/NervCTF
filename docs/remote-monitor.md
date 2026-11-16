@@ -65,8 +65,44 @@ In split-machine mode, Docker commands run on a separate worker node over SSH (`
 | `MAX_INSTANCES_PER_TEAM` | `0` | Max active instances per team (0 = unlimited) |
 | `CTFD_DB_SYNC_INTERVAL` | `30` | Seconds between CTFd-to-SQLite sync cycles |
 | `CTFD_DOMAIN` | `""` | CTFd base URL shown in dashboard links (for example `http://ctfd.example.com`); defaults to `http://{PUBLIC_HOST}`. The playbook sets it from `ctfd_domain` in `.nervctf.yml`. |
+| `LOKI_URL` | `http://127.0.0.1:3100/loki/api/v1/push` | Push endpoint passed to the `log_proxy` sidecar's `--log-driver=loki`. Always loopback in both modes — see the Loki section below. |
 
 ---
+
+## HTTP traffic logging (`log_proxy`)
+
+A `connection: http` challenge with `log_proxy: true` gets an `nervctf-proxy` sidecar in
+front of it that ships one structured JSON log line per request/response straight to Loki
+(Docker's `loki` logging-driver plugin), tagged with `team_id`/`challenge` labels — see
+[instance challenges](instance-challenges.md#http-traffic-logging-log_proxy) for the opt-in
+scoping and WebSocket/streaming caveats. There is no monitor-side route for this; it's viewed
+directly in Grafana's **NervCTF Player Traffic** dashboard, templated on `$challenge`/`$team_id`.
+
+**Loki itself** is deployed by `nervctf setup`/`setup --upgrade` alongside
+Prometheus/Grafana, always bound `127.0.0.1:3100` on the primary (CTFd) host — never exposed
+beyond loopback. In split-machine mode the sidecar runs on the **runner** host, so its
+`docker`/`docker compose` logging-driver push (which happens in the runner's own dockerd
+network namespace, not the challenge container's) needs to reach that loopback address
+remotely: `nervctf setup` installs a systemd unit, `nervctf-loki-tunnel.service`, running
+`autossh -R 3100:127.0.0.1:3100 <runner>` on the primary host using the same
+`monitor_ssh_key` already trusted for `RUNNER_SSH_TARGET` docker commands. This makes the
+runner's own `127.0.0.1:3100` forward back to the primary's Loki — no firewall change, no
+public exposure, same SSH trust the rest of split-machine mode already relies on.
+
+The `grafana/loki-docker-driver` Docker plugin (required for `--log-driver=loki`) is
+installed on whichever host actually runs the sidecar: the primary host in single-machine
+mode, the runner host in split-machine mode.
+
+---
+
+## Host resource monitoring
+
+Every `nervctf setup`/`setup --upgrade` run always adds `prometheus`, `node-exporter`, and `grafana` services to `docker-compose.override.yml` on the CTFd host. There's nothing to configure: a "NervCTF Host Resources" dashboard (CPU/RAM/disk/network) is pre-provisioned in Grafana at setup time. This is unrelated to the Loki/player-traffic dashboard above — separate datasource, separate data, just host-level metrics.
+
+- `node-exporter` reads `/proc`, `/sys`, and `/` (bind-mounted read-only) to report real host metrics; it has no published port and is reachable only by `prometheus` over the compose network.
+- `prometheus` scrapes `node-exporter:9100` every 15s and stores data in `<ctfd_path>/prometheus/data`; loopback-only, unconditionally (`127.0.0.1:9090`) — nothing needs it published, not even in split-machine mode.
+- `grafana` is loopback-only by default (`ssh -L 3000:localhost:3000 <user>@<ctfd-host>`, then `http://localhost:3000`, credentials `admin` / `monitor_token`), bound to all interfaces in split-machine mode (firewall port 3000 yourself in that case).
+- **Scope**: this covers the CTFd host only. In split-machine mode, the runner host (where challenge containers actually run) is not monitored — that's a gap, not a design choice; extending `node-exporter` to the runner would need its own Ansible role and a Prometheus scrape target pointed at it over the network, which isn't wired up yet.
 
 ## Schema detection
 

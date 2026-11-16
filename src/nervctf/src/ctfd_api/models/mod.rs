@@ -263,6 +263,12 @@ pub struct InstanceConfig {
     /// Mutually exclusive with `internal_ports` (validator warns if both set).
     #[serde(default)]
     pub service_ports: Option<std::collections::HashMap<String, Vec<PortSpec>>>,
+    /// Opt-in HTTP traffic-logging sidecar (only meaningful with `connection: http`).
+    /// Off by default — re-terminates HTTP through our own proxy, which can alter or
+    /// break challenges whose puzzle is HTTP behavior itself (WebSockets, streaming,
+    /// request smuggling, raw socket timing). See docs/instance-challenges.md.
+    #[serde(default)]
+    pub log_proxy: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]

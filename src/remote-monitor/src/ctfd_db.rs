@@ -1175,7 +1175,7 @@ pub async fn recompute_instance_decay(pool: &Pool) -> Result<()> {
         return Ok(());
     }
 
-    let scored: Vec<(i64, i64, i64, i64, String)> = conn.exec(
+    let scored: Vec<(i64, i64, i64, i64, Option<String>)> = conn.exec(
         "SELECT i.id, i.initial_value, i.minimum_value, i.decay_value, i.decay_function \
          FROM nervctf_instance_challenge i \
          WHERE i.initial_value IS NOT NULL AND i.minimum_value IS NOT NULL \
@@ -1193,7 +1193,8 @@ pub async fn recompute_instance_decay(pool: &Pool) -> Result<()> {
             .map_err(|e| anyhow!("ctfd_db: recompute_instance_decay: count: {}", e))?
             .unwrap_or(0);
 
-        let value = decay_value(initial, minimum, decay, &function, solve_count);
+        let function = function.as_deref().unwrap_or("logarithmic");
+        let value = decay_value(initial, minimum, decay, function, solve_count);
         conn.exec_drop(
             "UPDATE challenges SET value = ? WHERE id = ?",
             (value, challenge_id),

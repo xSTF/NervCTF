@@ -10,3 +10,8 @@ dist/
 .claude
 CLAUDE.md
 #thesis/
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+# Stray local build artifacts at repo root
+/nervctf
+/remote-monitor
