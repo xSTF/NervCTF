@@ -88,6 +88,7 @@
       user:
         name: "{{ docker_user }}"
         groups: docker
+        append: yes
         shell: /bin/bash
         state: present
         create_home: yes
@@ -1059,6 +1060,7 @@
       user:
         name: "{{ docker_user }}"
         groups: docker
+        append: yes
         shell: /bin/bash
         state: present
         create_home: yes
