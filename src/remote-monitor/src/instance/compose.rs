@@ -56,7 +56,11 @@ pub async fn compose_cmd() -> tokio::process::Command {
 /// `flag_file_path`   — absolute path inside the container (required for `"file"` mode)
 /// `flag_service`     — service that receives the flag file mount; defaults to `primary_service`
 /// `team_id`/`challenge_name` — passed to the proxy sidecar's env (`TEAM_ID`/`CHALLENGE_NAME`)
-///                      when `http_proxy` is true; unused otherwise.
+///                      when `http_proxy` is true; also attached as Loki labels on every
+///                      service (see `loki_url`), unused for env otherwise.
+/// `team_name`        — team's display name if known (looked up from CTFd's `teams`
+///                      table); attached as an extra `team_name` Loki label alongside
+///                      `team_id` so Grafana can show/filter by name instead of ID.
 /// `http_proxy`       — when true (challenge opted in via `log_proxy: true` and
 ///                      `connection: http`), the primary service is *not* published
 ///                      directly; instead an `nervctf-proxy` sidecar is published on its
@@ -79,6 +83,7 @@ pub async fn up(
     flag_file_path: Option<&str>,
     flag_service: Option<&str>,
     team_id: i64,
+    team_name: Option<&str>,
     challenge_name: &str,
     http_proxy: bool,
     loki_url: Option<&str>,
@@ -165,6 +170,16 @@ pub async fn up(
     // single-machine mode, or via the primary→runner reverse SSH tunnel in
     // split-machine mode; see the Ansible playbooks).
     let loki = loki_url.unwrap_or("http://127.0.0.1:3100/loki/api/v1/push");
+    // Loki's `loki-external-labels` option is a comma-separated `key=val` list — a raw
+    // team name containing a comma or `=` would corrupt it, so it's sanitized through
+    // the same slug function used for container names.
+    let mut loki_labels = format!("team_id={},challenge={}", team_id, challenge_name);
+    if let Some(name) = team_name {
+        let safe = super::sanitize_name(name);
+        if !safe.is_empty() {
+            loki_labels.push_str(&format!(",team_name={}", safe));
+        }
+    }
 
     // Build the per-instance override YAML.
     //
@@ -209,8 +224,8 @@ pub async fn up(
                 }
             }
             override_content.push_str(&format!(
-                "    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"team_id={},challenge={}\"\n",
-                loki, team_id, challenge_name,
+                "    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"{}\"\n",
+                loki, loki_labels,
             ));
         }};
     }
@@ -234,8 +249,8 @@ pub async fn up(
         let tsvc_str = tsvc.as_str();
         if tsvc_str != svc_name && !pre_built_services.iter().any(|s| s.as_str() == tsvc_str) {
             override_content.push_str(&format!(
-                "  {}:\n    volumes:\n      - {}:{}:ro\n    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"team_id={},challenge={}\"\n",
-                tsvc_str, hp, cp, loki, team_id, challenge_name,
+                "  {}:\n    volumes:\n      - {}:{}:ro\n    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"{}\"\n",
+                tsvc_str, hp, cp, loki, loki_labels,
             ));
         }
     }
@@ -250,8 +265,8 @@ pub async fn up(
             .map(|(_, ip, _)| *ip)
             .unwrap_or(80);
         override_content.push_str(&format!(
-            "  proxy:\n    image: nervctf-proxy:latest\n    restart: unless-stopped\n    ports:\n      - \"{}:8080\"\n    environment:\n      - UPSTREAM=http://{}:{}\n      - TEAM_ID={}\n      - CHALLENGE_NAME={}\n      - LISTEN_PORT=8080\n    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"team_id={},challenge={}\"\n",
-            host_port, svc_name, primary_internal_port, team_id, challenge_name, loki, team_id, challenge_name,
+            "  proxy:\n    image: nervctf-proxy:latest\n    restart: unless-stopped\n    ports:\n      - \"{}:8080\"\n    environment:\n      - UPSTREAM=http://{}:{}\n      - TEAM_ID={}\n      - CHALLENGE_NAME={}\n      - LISTEN_PORT=8080\n    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"{}\"\n",
+            host_port, svc_name, primary_internal_port, team_id, challenge_name, loki, loki_labels,
         ));
     }
 

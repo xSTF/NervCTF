@@ -280,6 +280,32 @@ pub fn get_ctfd_id(db: &Db, challenge_name: &str) -> Result<Option<i64>> {
     }
 }
 
+/// Look up a display name for the per-player identity (`team_id` in team-mode, the
+/// player's own user id in user-mode — see `ctfd_db::validate_token`), from whichever
+/// local cache actually holds that namespace: `ctfd_teams` in team-mode, `ctfd_users`
+/// in user-mode (both kept in sync by `ctfd_db::sync_users_and_teams`). Used to attach
+/// a human-readable `team_name` Loki label alongside the numeric identity for the
+/// Grafana dashboard.
+///
+/// The mode is passed explicitly rather than trying both tables and taking whichever
+/// matches: a deployment that was briefly in team-mode before switching to user-mode
+/// can have stale `teams` rows synced into `ctfd_teams` with no mode filtering, which
+/// could numerically collide with a real user id now used as the identity.
+pub fn get_identity_name(db: &Db, identity: i64, mode: crate::ctfd_db::CtfdMode) -> Result<Option<String>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let table = if mode == crate::ctfd_db::CtfdMode::UserMode { "ctfd_users" } else { "ctfd_teams" };
+    let result = conn.query_row(
+        &format!("SELECT name FROM {} WHERE id = ?1", table),
+        params![identity],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(name) => Ok(Some(name)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn update_image_tag(db: &Db, challenge_name: &str, image_tag: &str) -> Result<()> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     conn.execute(

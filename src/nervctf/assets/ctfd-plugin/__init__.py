@@ -28,8 +28,9 @@ from CTFd.models import (
 )
 from CTFd.plugins import register_plugin_assets_directory
 from CTFd.plugins.challenges import CHALLENGE_CLASSES, BaseChallenge
+from CTFd.utils import get_config
 from CTFd.utils.decorators import authed_only
-from CTFd.utils.user import get_current_team
+from CTFd.utils.user import get_current_team, get_current_user
 from flask import Blueprint, request
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,26 @@ def _monitor_json(resp):
     return resp.json()
 
 
+def _is_user_mode():
+    return get_config("user_mode") == "users"
+
+
 def _team_id():
+    """Per-player identity used throughout this plugin and sent to the monitor
+    as `team_id`. In CTFd team-mode this is the player's real team id. In
+    user-mode (no teams feature at all) it's the player's own user id instead,
+    so instance challenges work the same way for solo players.
+
+    The user-id fallback is gated on CTFd's actual `user_mode` config, not on
+    `get_current_team()` merely being falsy — a team-mode player can have no
+    team yet for other reasons (not joined one, team deleted), and falling
+    back to their own user id in that case would let a teamless team-mode
+    player's numeric user id collide with and act as a *real* team's id
+    (team and user ids are both small sequential integers from the same
+    namespace), an IDOR risk independent of user-mode support."""
+    if _is_user_mode():
+        user = get_current_user()
+        return user.id if user else None
     team = get_current_team()
     return team.id if team else None
 
@@ -311,7 +331,11 @@ class InstanceChallengeType(BaseChallenge):
     def solve(cls, user, team, challenge, request):
         BaseChallenge.solve(user, team, challenge, request)
         # Tear down the instance now that the team has solved the challenge.
-        team_id = team.id if team else None
+        # Same identity logic as `_team_id()` (gated on confirmed user-mode, not
+        # mere team-absence — see its docstring) — this doesn't call that helper
+        # since `team`/`user` are already given directly by CTFd's own solve()
+        # signature, so there's no need to re-fetch them.
+        team_id = (user.id if user else None) if _is_user_mode() else (team.id if team else None)
         if team_id:
             m = _monitor()
             if m:
@@ -415,9 +439,20 @@ def get_instance_info(challenge_id):
     if not team_id:
         return {"error": "Not in a team"}, 403
 
-    # If the team already solved this challenge, no instance is needed.
+    # If the team (or, in user-mode, the player themself) already solved this
+    # challenge, no instance is needed. CTFd's own Solves rows are keyed by
+    # team_id in team-mode but only by user_id in user-mode (team_id is NULL
+    # there), so this can't just filter by `team_id = team_id` unconditionally.
+    # Gated on confirmed user-mode (`_is_user_mode()`), not team-absence — same
+    # reasoning as `_team_id()`.
     from CTFd.models import Solves
-    if Solves.query.filter_by(challenge_id=challenge.id, team_id=team_id).first():
+    if _is_user_mode():
+        user = get_current_user()
+        already_solved = Solves.query.filter_by(challenge_id=challenge.id, user_id=user.id).first() if user else None
+    else:
+        team = get_current_team()
+        already_solved = Solves.query.filter_by(challenge_id=challenge.id, team_id=team.id).first() if team else None
+    if already_solved:
         return {"status": "solved"}, 200
 
     m = _monitor()

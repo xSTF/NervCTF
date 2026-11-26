@@ -104,6 +104,10 @@ pub async fn provision(
     container_name_hint: Option<String>,
     // Loki push endpoint for `log_proxy`-enabled `connection: http` instances.
     loki_url: Option<&str>,
+    // CTFd team-mode vs user-mode, for resolving a display name for Loki's
+    // `team_name` label (ctfd_teams in team-mode, ctfd_users in user-mode —
+    // see `db::get_identity_name`).
+    ctfd_mode: crate::ctfd_db::CtfdMode,
 ) -> Result<(String, u16, String, String)> {
     let backend = config["backend"].as_str().unwrap_or("docker");
     let connection = config["connection"].as_str().unwrap_or("nc").to_string();
@@ -182,6 +186,7 @@ pub async fn provision(
             // HTTP sidecars — so admins can see raw logs for any challenge (nc, ssh, …) on the
             // "NervCTF Player Traffic" Grafana dashboard, filtered by challenge/team.
             let loki = loki_url.unwrap_or("http://127.0.0.1:3100/loki/api/v1/push");
+            let team_name = crate::db::get_identity_name(db, team_id, ctfd_mode).unwrap_or(None);
 
             let container_id = docker::run_container(
                 &image_tag,
@@ -191,7 +196,7 @@ pub async fn provision(
                 &env_vars,
                 &volumes,
                 proxy_net.as_deref(),
-                &docker::loki_log_args(loki, team_id, challenge_name),
+                &docker::loki_log_args(loki, team_id, team_name.as_deref(), challenge_name),
                 runner_ssh,
             ).await?;
 
@@ -212,7 +217,7 @@ pub async fn provision(
                     &proxy_env,
                     &[],
                     proxy_net.as_deref(),
-                    &docker::loki_log_args(loki, team_id, challenge_name),
+                    &docker::loki_log_args(loki, team_id, team_name.as_deref(), challenge_name),
                     runner_ssh,
                 ).await?;
             }
@@ -314,6 +319,7 @@ pub async fn provision(
                 };
 
             let log_proxy = connection == "http" && config["log_proxy"].as_bool().unwrap_or(false);
+            let team_name = crate::db::get_identity_name(db, team_id, ctfd_mode).unwrap_or(None);
             let (_, project) = compose::up(
                 &compose_path,
                 &project_name,
@@ -324,6 +330,7 @@ pub async fn provision(
                 flag_file_path,
                 flag_service,
                 team_id,
+                team_name.as_deref(),
                 challenge_name,
                 log_proxy,
                 loki_url,

@@ -14,7 +14,7 @@ pub fn create_pool(url: &str) -> Result<Pool> {
     Ok(Pool::new(opts))
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CtfdMode {
     TeamMode,
     UserMode,
@@ -56,6 +56,11 @@ pub async fn detect_ctfd_mode(pool: &mysql_async::Pool) -> CtfdMode {
         Err(_) => return CtfdMode::Unknown,
     };
     match row.as_deref() {
+        // Real CTFd convention: the `user_mode` config value is the literal string
+        // "teams" or "users" (see CTFd's own setup wizard / `docs/cli-reference.md`).
+        Some("teams") => CtfdMode::TeamMode,
+        Some("users") => CtfdMode::UserMode,
+        // Fallback aliases for any build/fork that stores a boolean-ish value instead.
         Some("1") | Some("true") => CtfdMode::UserMode,
         Some("0") | Some("false") | Some("") | None => CtfdMode::TeamMode,
         _ => CtfdMode::Unknown,
@@ -95,8 +100,13 @@ pub async fn delete_flag(pool: &Pool, flag_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Validate a CTFd API token and return team_id, or None if invalid/banned/hidden/teamless.
-pub async fn validate_token(pool: &Pool, token: &str) -> Option<i64> {
+/// Validate a CTFd API token and return the player's identity, or None if
+/// invalid/banned/hidden. The identity is the real `team_id` in team-mode
+/// (and as a safe fallback in `Unknown` mode, matching pre-user-mode-support
+/// behavior exactly); in user-mode (no teams at all, `users.team_id` is
+/// always NULL) it's the player's own `users.id` instead, so instance
+/// challenges work the same way for solo players.
+pub async fn validate_token(pool: &Pool, token: &str, mode: CtfdMode) -> Option<i64> {
     let mut conn = match pool.get_conn().await {
         Ok(c) => c,
         Err(e) => {
@@ -104,9 +114,15 @@ pub async fn validate_token(pool: &Pool, token: &str) -> Option<i64> {
             return None;
         }
     };
-    let sql = "SELECT team_id FROM users WHERE token = ? AND banned = 0 AND hidden = 0 LIMIT 1";
-    match conn.exec_first::<Option<i64>, _, _>(sql, (token,)).await {
-        Ok(Some(team_id)) => team_id,
+    let sql = "SELECT id, team_id FROM users WHERE token = ? AND banned = 0 AND hidden = 0 LIMIT 1";
+    match conn.exec_first::<(i64, Option<i64>), _, _>(sql, (token,)).await {
+        Ok(Some((id, team_id))) => {
+            if mode == CtfdMode::UserMode {
+                Some(id)
+            } else {
+                team_id
+            }
+        }
         Ok(None) => None,
         Err(e) => {
             warn!("ctfd_db: validate_token error: {}", e);
@@ -1060,9 +1076,10 @@ pub async fn run_probe(pool: &mysql_async::Pool) -> ProbeResult {
         "degraded"
     }.to_string();
 
+    // Both team-mode and user-mode are fully supported — `validate_token` resolves the
+    // player's identity correctly in either case (see its doc comment).
     let cap_player_auth = match is_team_mode {
-        Some(true) => "ok",
-        Some(false) => "broken",
+        Some(true) | Some(false) => "ok",
         None => "degraded",
     }.to_string();
 
@@ -1081,11 +1098,6 @@ pub async fn run_probe(pool: &mysql_async::Pool) -> ProbeResult {
     if cap_dynamic_scoring == "broken" {
         probe_notes.push(
             "Partial inline scoring migration detected — deploy of dynamic challenges will fail with SQL errors".to_string(),
-        );
-    }
-    if cap_player_auth == "broken" {
-        probe_notes.push(
-            "CTFd is in user-mode — all player instance requests will return 403".to_string(),
         );
     }
     if cap_player_auth == "degraded" {
@@ -1133,18 +1145,35 @@ pub async fn run_probe(pool: &mysql_async::Pool) -> ProbeResult {
 /// `ctfd_solves` SQLite cache.  Performs a full replace so deleted submissions
 /// are also removed from the cache.  Read-only against MariaDB.
 ///
+/// In user-mode, `submissions.team_id` is always NULL (CTFd has no teams), so the
+/// team-mode query would always return zero rows. `mode` selects the right source
+/// column; in user-mode the player's own `user_id` is stored in the cache's
+/// `team_id` slot too (matching the same identity-substitution used everywhere
+/// else — see `validate_token`), so `has_correct_solve`/`list_correct_solves`
+/// keep working unchanged downstream.
+///
 /// Called by the background sync task every `CTFD_DB_SYNC_INTERVAL` seconds.
-pub async fn sync_solves(pool: &Pool, db: &Db) -> Result<()> {
+pub async fn sync_solves(pool: &Pool, db: &Db, mode: CtfdMode) -> Result<()> {
     let mut conn = pool.get_conn().await
         .map_err(|e| anyhow!("ctfd_db: sync_solves: get_conn: {}", e))?;
 
-    let rows: Vec<(i64, Option<i64>, String, String)> = conn.exec(
-        "SELECT s.team_id, s.user_id, c.name, DATE_FORMAT(s.date, '%Y-%m-%d %H:%i:%S') \
-         FROM submissions s \
-         JOIN challenges c ON c.id = s.challenge_id \
-         WHERE s.type = 'correct' AND s.team_id IS NOT NULL",
-        (),
-    ).await.map_err(|e| anyhow!("ctfd_db: sync_solves: query: {}", e))?;
+    let rows: Vec<(i64, Option<i64>, String, String)> = if mode == CtfdMode::UserMode {
+        conn.exec(
+            "SELECT s.user_id, s.user_id, c.name, DATE_FORMAT(s.date, '%Y-%m-%d %H:%i:%S') \
+             FROM submissions s \
+             JOIN challenges c ON c.id = s.challenge_id \
+             WHERE s.type = 'correct' AND s.user_id IS NOT NULL",
+            (),
+        ).await.map_err(|e| anyhow!("ctfd_db: sync_solves: query: {}", e))?
+    } else {
+        conn.exec(
+            "SELECT s.team_id, s.user_id, c.name, DATE_FORMAT(s.date, '%Y-%m-%d %H:%i:%S') \
+             FROM submissions s \
+             JOIN challenges c ON c.id = s.challenge_id \
+             WHERE s.type = 'correct' AND s.team_id IS NOT NULL",
+            (),
+        ).await.map_err(|e| anyhow!("ctfd_db: sync_solves: query: {}", e))?
+    };
 
     let n = rows.len();
     crate::db::replace_ctfd_solves(db, &rows)
@@ -1167,7 +1196,12 @@ pub async fn sync_solves(pool: &Pool, db: &Db) -> Result<()> {
 /// scoring config (initial/minimum/decay), writing the result back to CTFd's
 /// `challenges.value`. Mirrors CTFd's `dynamic_challenges/decay.py` formulas so
 /// instance challenges score identically to `dynamic` ones.
-pub async fn recompute_instance_decay(pool: &Pool) -> Result<()> {
+///
+/// In user-mode, `solves.team_id` is always NULL, so the team-mode solve-count
+/// query (an INNER JOIN on `teams`) always returns 0 — every instance challenge's
+/// value would be stuck at `initial_value` forever. `mode` selects a join against
+/// `users` by `user_id` instead in that case.
+pub async fn recompute_instance_decay(pool: &Pool, mode: CtfdMode) -> Result<()> {
     let mut conn = pool.get_conn().await
         .map_err(|e| anyhow!("ctfd_db: recompute_instance_decay: get_conn: {}", e))?;
 
@@ -1184,12 +1218,16 @@ pub async fn recompute_instance_decay(pool: &Pool) -> Result<()> {
     ).await.map_err(|e| anyhow!("ctfd_db: recompute_instance_decay: query: {}", e))?;
 
     for (challenge_id, initial, minimum, decay, function) in scored {
-        let solve_count: i64 = conn.exec_first::<i64, _, _>(
+        let count_sql = if mode == CtfdMode::UserMode {
+            "SELECT COUNT(*) FROM solves s \
+             JOIN users u ON u.id = s.user_id \
+             WHERE s.challenge_id = ? AND u.hidden = 0 AND u.banned = 0"
+        } else {
             "SELECT COUNT(*) FROM solves s \
              JOIN teams t ON t.id = s.team_id \
-             WHERE s.challenge_id = ? AND t.hidden = 0 AND t.banned = 0",
-            (challenge_id,),
-        ).await
+             WHERE s.challenge_id = ? AND t.hidden = 0 AND t.banned = 0"
+        };
+        let solve_count: i64 = conn.exec_first::<i64, _, _>(count_sql, (challenge_id,)).await
             .map_err(|e| anyhow!("ctfd_db: recompute_instance_decay: count: {}", e))?
             .unwrap_or(0);
 

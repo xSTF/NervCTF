@@ -579,12 +579,30 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
     }
 
     // unknown YAML keys
+    const INSTANCE_ONLY_KEYS: &[&str] = &[
+        "backend", "image", "compose_file", "compose_service", "lxc_image",
+        "vagrantfile", "internal_port", "internal_ports", "connection",
+        "timeout_minutes", "max_renewals", "command", "flag_mode", "flag_prefix",
+        "flag_suffix", "random_flag_length", "flag_delivery", "flag_file_path",
+        "flag_service", "service_ports", "log_proxy",
+    ];
     for key in &c.unknown_yaml_keys {
-        issues.push(Issue::warn(
-            name,
-            key,
-            format!("unknown YAML key '{}' — not in the ctfcli spec, will be ignored", key),
-        ));
+        if INSTANCE_ONLY_KEYS.contains(&key.as_str()) {
+            issues.push(Issue::warn(
+                name,
+                key,
+                format!(
+                    "'{}' found at the top level but it's an `instance:` field — nest it under `instance:` or it has no effect",
+                    key,
+                ),
+            ));
+        } else {
+            issues.push(Issue::warn(
+                name,
+                key,
+                format!("unknown YAML key '{}' — not in the ctfcli spec, will be ignored", key),
+            ));
+        }
     }
 
     issues

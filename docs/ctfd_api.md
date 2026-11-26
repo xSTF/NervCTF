@@ -281,7 +281,7 @@ Every capability is one of `"ok"`, `"degraded"`, `"broken"`, or `"unknown"`.
 |---|---|
 | `cap_challenge_crud` | INSERT/UPDATE/DELETE on the `challenges` table |
 | `cap_dynamic_scoring` | `dynamic_challenge` table state and inline scoring columns |
-| `cap_player_auth` | Team-mode detection; user-mode CTFd blocks every player instance route |
+| `cap_player_auth` | Team-mode/user-mode detection; player auth works correctly in either mode |
 | `cap_instance_flags` | `nervctf_instance_challenge` table presence |
 | `cap_redis_sync` | Redis cache invalidation after direct MariaDB writes |
 
@@ -290,7 +290,6 @@ Every capability is one of `"ok"`, `"degraded"`, `"broken"`, or `"unknown"`.
 Before any remote writes, `nervctf deploy` fetches the cached probe result (no `--refresh`). The rules:
 
 - **`cap_dynamic_scoring == "broken"`** — deploy aborts with exit code 1. The `dynamic_challenge` table is in a partial migration state, and deploying dynamic challenges would produce runtime SQL errors.
-- **`cap_player_auth == "broken"`** — a warning is printed and deploy continues. Instance challenges will not be reachable by players until CTFd is switched to team mode.
 - **Degraded capabilities** — a summary line lists which capabilities are degraded. Run `nervctf probe` for the full report.
 - **Version mismatch** — when the probe reports a `ctfd_version_tag` different from the `TESTED_CTFD_VERSION` constant (`3.7.3`), a warning is printed and deploy continues with caution.
 - **Probe unavailable** — when the monitor does not implement the probe endpoint (an older monitor binary), a warning is printed and deploy continues. This keeps compatibility with pre-probe monitor versions.

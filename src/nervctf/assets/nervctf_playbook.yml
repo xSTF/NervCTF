@@ -694,6 +694,15 @@
                   "refresh": 2,
                   "includeAll": true,
                   "multi": true
+                },
+                {
+                  "name": "team_name",
+                  "type": "query",
+                  "datasource": { "type": "loki", "uid": "loki" },
+                  "query": "label_values(team_name)",
+                  "refresh": 2,
+                  "includeAll": true,
+                  "multi": true
                 }
               ]
             },
@@ -717,9 +726,9 @@
                         "req_body_truncated": true, "resp_body_truncated": true,
                         "ts_ms": true
                       },
-                      "indexByName": { "Time": 0, "method": 1, "path": 2, "status": 3, "duration_ms": 4 },
+                      "indexByName": { "Time": 0, "team_name": 1, "method": 2, "path": 3, "status": 4, "duration_ms": 5 },
                       "renameByName": {
-                        "method": "Method", "path": "Path", "status": "Status",
+                        "team_name": "Team", "method": "Method", "path": "Path", "status": "Status",
                         "duration_ms": "Duration (ms)"
                       }
                     }
@@ -728,7 +737,7 @@
                 "targets": [
                   {
                     "datasource": { "type": "loki", "uid": "loki" },
-                    "expr": "{challenge=~\"$challenge\", team_id=~\"$team_id\"} | json",
+                    "expr": "{challenge=~\"$challenge\", team_id=~\"$team_id\", team_name=~\"$team_name\"} | json",
                     "queryType": "range"
                   }
                 ]
@@ -743,7 +752,7 @@
                 "targets": [
                   {
                     "datasource": { "type": "loki", "uid": "loki" },
-                    "expr": "{challenge=~\"$challenge\", team_id=~\"$team_id\"}",
+                    "expr": "{challenge=~\"$challenge\", team_id=~\"$team_id\", team_name=~\"$team_name\"}",
                     "queryType": "range"
                   }
                 ]

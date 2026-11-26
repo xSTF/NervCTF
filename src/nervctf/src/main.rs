@@ -679,13 +679,6 @@ async fn deploy_challenges(
                 );
                 std::process::exit(1);
             }
-            // Warning: broken player auth
-            if probe.cap_player_auth == "broken" {
-                eprintln!(
-                    "[!] CTFd is in user-mode. Instance challenges will not be accessible\n    \
-                     to players (all token authentication returns 403)."
-                );
-            }
             // Summary line for degraded
             let degraded: Vec<&str> = [
                 ("challenge_crud",  probe.cap_challenge_crud.as_str()),

@@ -135,11 +135,11 @@ SELECT `value` FROM <settings_table> WHERE `key` = 'user_mode' LIMIT 1
 
 | Result | `CtfdMode` | Logged as |
 |---|---|---|
-| `'1'` or `'true'` | `UserMode` | `WARN` — all player routes will return 403 |
-| `'0'`, `'false'`, `''`, or key absent | `TeamMode` | `INFO` — authentication will work |
-| Query error or inaccessible table | `Unknown` | `WARN` — verify manually |
+| `'teams'` (or legacy `'0'`/`'false'`/`''`/key absent) | `TeamMode` | `INFO` — authentication will work |
+| `'users'` (or legacy `'1'`/`'true'`) | `UserMode` | `INFO` — authentication uses each player's own user id |
+| Query error or inaccessible table | `Unknown` | `WARN` — verify manually; treated as team-mode for auth |
 
-In user-mode, `validate_token()` returns `None` for every user because `users.team_id IS NULL`, and all four player routes (`/instance/request`, `/instance/info`, `/instance/renew`, `/instance/stop`) return 403. The startup warning lets the operator catch this before the CTF goes live.
+Both modes are fully supported. In team-mode, `validate_token()` returns the player's real `team_id`. In user-mode (`users.team_id` is always `NULL`), it falls back to the player's own `users.id` instead, so the four player routes (`/instance/request`, `/instance/info`, `/instance/renew`, `/instance/stop`) work the same way for solo players — each player is simply their own "team" for instance-ownership purposes.
 
 ---
 
@@ -395,7 +395,7 @@ The response uses the usual envelope:
 |---|---|---|---|
 | `cap_challenge_crud` | `has_next_id` | `!has_next_id` (CTFd < 3.5.x) | — |
 | `cap_dynamic_scoring` | inline scoring, or a clean join-table path | — | `dynamic_partial` (broken migration) |
-| `cap_player_auth` | `is_team_mode == true` | mode unknown | `is_team_mode == false` (user-mode) |
+| `cap_player_auth` | `is_team_mode == true` or `== false` (team- or user-mode, both supported) | mode unknown | — |
 | `cap_instance_flags` | `has_instance_table` | plugin table absent | — |
 | `cap_redis_sync` | — | always (MariaDB writes bypass Redis) | — |
 

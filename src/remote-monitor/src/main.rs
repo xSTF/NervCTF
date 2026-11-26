@@ -93,6 +93,12 @@ struct AppState {
     /// Global cap on active instances (running + provisioning) per team across all
     /// challenges.  0 = unlimited.
     max_instances_per_team: u64,
+    /// CTFd team-mode vs user-mode, detected once at startup (see `ctfd_db::detect_ctfd_mode`).
+    /// Never re-detected at runtime: every per-player identity written to SQLite
+    /// (`instances.team_id`, `team_flags`, `ctfd_solves`, ...) is keyed under this
+    /// mode's interpretation, so flipping it mid-event would orphan existing rows.
+    /// A genuine CTFd mode change requires a monitor restart to take effect.
+    ctfd_mode: ctfd_db::CtfdMode,
 }
 
 #[tokio::main]
@@ -153,10 +159,9 @@ async fn main() -> Result<()> {
     let ctfd_mode = ctfd_db::detect_ctfd_mode(&ctfd_pool).await;
     match ctfd_mode {
         ctfd_db::CtfdMode::UserMode => {
-            tracing::warn!(
-                "CTFd is running in USER-MODE. All player instance requests will return 403 \
-                 because token validation requires a non-null team_id. Switch CTFd to team-mode \
-                 or run 'nervctf probe' to see the full capability report."
+            tracing::info!(
+                "CTFd mode: user (no teams — player authentication uses each player's own \
+                 CTFd user id in place of a team id)"
             );
         }
         ctfd_db::CtfdMode::Unknown => {
@@ -232,6 +237,7 @@ async fn main() -> Result<()> {
         loki_url,
         provision_sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent_provisions)),
         max_instances_per_team,
+        ctfd_mode,
     });
 
     // Spawn background CTFd solve sync task (read-only from MariaDB → SQLite cache)
@@ -239,13 +245,14 @@ async fn main() -> Result<()> {
         .ok().and_then(|s| s.parse().ok()).unwrap_or(30);
     let sync_db = db.clone();
     let sync_pool = state.ctfd_pool.clone();
+    let sync_mode = state.ctfd_mode;
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(sync_interval)).await;
-            if let Err(e) = ctfd_db::sync_solves(&sync_pool, &sync_db).await {
+            if let Err(e) = ctfd_db::sync_solves(&sync_pool, &sync_db, sync_mode).await {
                 warn!("ctfd sync solves: {}", e);
             }
-            if let Err(e) = ctfd_db::recompute_instance_decay(&sync_pool).await {
+            if let Err(e) = ctfd_db::recompute_instance_decay(&sync_pool, sync_mode).await {
                 warn!("ctfd decay recompute: {}", e);
             }
             if let Err(e) = ctfd_db::sync_users_and_teams(&sync_pool, &sync_db).await {
@@ -478,12 +485,15 @@ fn session_expires_at() -> String {
     instance::expires_at_string(60 * 24)
 }
 
-/// Validate a CTFd user token and return team_id via direct MariaDB lookup.
+/// Validate a CTFd user token and return the player's identity via direct
+/// MariaDB lookup (team_id in team-mode, the player's own user id in
+/// user-mode — see `ctfd_db::validate_token`).
 async fn validate_ctfd_token(
     pool: &mysql_async::Pool,
     token: &str,
+    mode: ctfd_db::CtfdMode,
 ) -> Option<i64> {
-    ctfd_db::validate_token(pool, token).await
+    ctfd_db::validate_token(pool, token, mode).await
 }
 
 // ── Basic handlers ────────────────────────────────────────────────────────────
@@ -1082,7 +1092,7 @@ async fn instance_request_handler(
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response(),
     };
 
-    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token).await {
+    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token, state.ctfd_mode).await {
         Some(id) => id,
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid CTFd token or not in a team"}))).into_response(),
     };
@@ -1141,10 +1151,15 @@ async fn instance_request_handler(
     // immediately (before compose::up returns and updates the row).
     let pre_container_name = instance::container_name(&body.challenge_name, team_id);
 
+    // In user-mode `team_id` above is already the player's own user id (see
+    // `validate_ctfd_token`) — record it as `user_id` too so the admin UI's
+    // `ctfd_users` display stays consistent, same as the plugin-auth path.
+    let user_id_for_mode = (state.ctfd_mode == ctfd_db::CtfdMode::UserMode).then_some(team_id);
+
     // Insert provisioning stub before spawning; UNIQUE constraint means a concurrent
     // request racing past the check above will hit INSERT OR IGNORE and we return 409.
     match db::insert_provisioning_stub(
-        &state.db, &body.challenge_name, team_id, None,
+        &state.db, &body.challenge_name, team_id, user_id_for_mode,
         &state.public_host, &connection_type, &expires_at,
         Some(&pre_container_name),
     ) {
@@ -1180,11 +1195,12 @@ async fn instance_request_handler(
         };
         info!("provision_bg (player): starting '{}' team {}", challenge_name_bg, team_id);
         match instance::provision(
-            &state_bg.db, &challenge_name_bg, team_id, None,
+            &state_bg.db, &challenge_name_bg, team_id, user_id_for_mode,
             &config, &state_bg.public_host, &state_bg.ctfd_pool,
             state_bg.runner_ssh_target.as_deref(),
             Some(container_name_bg),
             state_bg.loki_url.as_deref(),
+            state_bg.ctfd_mode,
         ).await {
             Ok((host, port, conn, _exp)) => {
                 info!("provision_bg (player): done {}:{} ({}) for '{}' team {}", host, port, conn, challenge_name_bg, team_id);
@@ -1217,7 +1233,7 @@ async fn instance_info_handler(
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response(),
     };
 
-    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token).await {
+    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token, state.ctfd_mode).await {
         Some(id) => id,
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid CTFd token"}))).into_response(),
     };
@@ -1259,7 +1275,7 @@ async fn instance_renew_handler(
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response(),
     };
 
-    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token).await {
+    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token, state.ctfd_mode).await {
         Some(id) => id,
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid CTFd token"}))).into_response(),
     };
@@ -1310,7 +1326,7 @@ async fn instance_stop_handler(
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response(),
     };
 
-    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token).await {
+    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token, state.ctfd_mode).await {
         Some(id) => id,
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid CTFd token"}))).into_response(),
     };
@@ -1504,6 +1520,7 @@ async fn plugin_request_handler(
             state_bg.runner_ssh_target.as_deref(),
             Some(container_name_bg),
             state_bg.loki_url.as_deref(),
+            state_bg.ctfd_mode,
         ).await {
             Ok((host, port, conn, _exp)) => {
                 info!("provision_bg: done {}:{} ({}) for '{}' team {}", host, port, conn, challenge_name_bg, team_id_bg);

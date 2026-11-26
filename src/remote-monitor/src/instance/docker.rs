@@ -9,20 +9,34 @@ use tokio::io::AsyncWriteExt as _;
 
 use super::ssh;
 
-/// `docker run` flags that switch the log-proxy sidecar's logging driver from the default
-/// `json-file` to the `loki` Docker logging-driver plugin, shipping each JSON access-log
-/// line straight to Loki with team/challenge labels attached for Grafana to query. Requires
+/// `docker run` flags that switch a container's logging driver from the default
+/// `json-file` to the `loki` Docker logging-driver plugin, shipping its stdout/stderr
+/// straight to Loki with team/challenge labels attached for Grafana to query. Requires
 /// `docker plugin install grafana/loki-docker-driver` on whichever host actually runs this
 /// container (the primary host in single-machine mode, the runner in split-machine mode —
 /// see the Ansible playbooks).
-pub fn loki_log_args(loki_url: &str, team_id: i64, challenge_name: &str) -> Vec<String> {
+///
+/// `team_name`, when known (looked up from CTFd's `teams` table via the local
+/// `ctfd_teams` cache), is attached as an extra `team_name` label alongside the numeric
+/// `team_id` so the Grafana dashboard can show/filter by team name instead of ID.
+/// Sanitized through `super::sanitize_name` since Loki's `loki-external-labels` option
+/// is a comma-separated `key=val` list — a raw team name containing a comma or `=`
+/// would corrupt it.
+pub fn loki_log_args(loki_url: &str, team_id: i64, team_name: Option<&str>, challenge_name: &str) -> Vec<String> {
+    let mut labels = format!("team_id={},challenge={}", team_id, challenge_name);
+    if let Some(name) = team_name {
+        let safe = super::sanitize_name(name);
+        if !safe.is_empty() {
+            labels.push_str(&format!(",team_name={}", safe));
+        }
+    }
     vec![
         "--log-driver".to_string(),
         "loki".to_string(),
         "--log-opt".to_string(),
         format!("loki-url={}", loki_url),
         "--log-opt".to_string(),
-        format!("loki-external-labels=team_id={},challenge={}", team_id, challenge_name),
+        format!("loki-external-labels={}", labels),
     ]
 }
 
