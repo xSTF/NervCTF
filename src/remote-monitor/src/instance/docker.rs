@@ -266,6 +266,34 @@ pub fn proxy_container_name(container_name: &str) -> String {
     format!("{}-proxy", container_name)
 }
 
+/// The log-proxy sidecar image. Built locally by the Ansible playbook
+/// (`docker build -t nervctf-proxy:latest`) and never published to a registry, so a
+/// missing image cannot be recovered by pulling — see `proxy_image_available`.
+pub const PROXY_IMAGE: &str = "nervctf-proxy:latest";
+
+/// Whether `PROXY_IMAGE` exists on the daemon that will run challenge containers
+/// (the runner in split-machine mode, this host otherwise).
+///
+/// The playbook only builds the image when `nervctf setup` found a `nervctf-proxy`
+/// binary to ship, so a deployment can legitimately be missing it. Compose and
+/// `docker run` would then try to pull `nervctf-proxy:latest` from Docker Hub and fail
+/// the whole provision with "pull access denied ... repository does not exist", which
+/// points at credentials rather than at the real cause. Callers check this first and
+/// skip the sidecar instead.
+pub async fn proxy_image_available(runner_ssh: Option<&str>) -> bool {
+    let output = if let Some(target) = runner_ssh {
+        ssh_output(target, &format!("docker image inspect '{}'", PROXY_IMAGE)).await
+    } else {
+        tokio::process::Command::new("docker")
+            .args(["image", "inspect", PROXY_IMAGE])
+            .output()
+            .await
+    };
+    // Treat a failure to even run docker/ssh as "absent": provisioning without the
+    // sidecar degrades logging, provisioning with an unverifiable image fails outright.
+    output.map(|o| o.status.success()).unwrap_or(false)
+}
+
 /// Create a user-defined bridge network for one instance, so the app container and
 /// its HTTP-proxy sidecar can reach each other by name. Best-effort: only used for
 /// `connection: http` docker-backend instances.
