@@ -453,6 +453,21 @@
                     "queryType": "range"
                   }
                 ]
+              },
+              {
+                "id": 2,
+                "title": "Raw Container Logs",
+                "type": "logs",
+                "gridPos": { "h": 12, "w": 24, "x": 0, "y": 16 },
+                "datasource": { "type": "loki", "uid": "loki" },
+                "options": { "showTime": true, "wrapLogMessage": true, "sortOrder": "Descending" },
+                "targets": [
+                  {
+                    "datasource": { "type": "loki", "uid": "loki" },
+                    "expr": "{challenge=~\"$challenge\", team_id=~\"$team_id\"}",
+                    "queryType": "range"
+                  }
+                ]
               }
             ]
           }
@@ -587,6 +602,7 @@
           {% else %}
                 - /var/run/docker.sock:/var/run/docker.sock
                 - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
+                - /tmp/ctf-flags:/tmp/ctf-flags
           {% endif %}
                 - {{ ctfd_path }}/remote-monitor/data:{{ ctfd_path }}/remote-monitor/data
                 - {{ ctfd_path }}/.data/CTFd/uploads:{{ ctfd_path }}/.data/CTFd/uploads

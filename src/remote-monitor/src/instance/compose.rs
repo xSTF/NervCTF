@@ -159,12 +159,22 @@ pub async fn up(
         None
     };
 
+    // Per-instance compose projects are never joined to the main ctfd stack's network,
+    // so the `loki` container-name DNS used by Grafana's datasource doesn't resolve
+    // here — this always goes over loopback instead (reachable directly in
+    // single-machine mode, or via the primary→runner reverse SSH tunnel in
+    // split-machine mode; see the Ansible playbooks).
+    let loki = loki_url.unwrap_or("http://127.0.0.1:3100/loki/api/v1/push");
+
     // Build the per-instance override YAML.
     //
     // Structure:
     //   1. Main service (svc_name): image + ports + optional flag volume.
     //   2. All other pre-built services: image + optional flag volume.
     //   3. Flag-service stub if it differs from the main service and wasn't pre-built.
+    // Every service ships stdout/stderr to Loki with team/challenge labels, not just the
+    // `log_proxy`-opted-in HTTP sidecar, so raw logs for any challenge (nc, ssh, …) show
+    // up on the "NervCTF Player Traffic" Grafana dashboard filtered by challenge/team.
     let mut override_content = String::from("services:\n");
 
     // Helper closure — add image + optional ports/volumes for one service.
@@ -198,6 +208,10 @@ pub async fn up(
                     ));
                 }
             }
+            override_content.push_str(&format!(
+                "    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"team_id={},challenge={}\"\n",
+                loki, team_id, challenge_name,
+            ));
         }};
     }
 
@@ -220,8 +234,8 @@ pub async fn up(
         let tsvc_str = tsvc.as_str();
         if tsvc_str != svc_name && !pre_built_services.iter().any(|s| s.as_str() == tsvc_str) {
             override_content.push_str(&format!(
-                "  {}:\n    volumes:\n      - {}:{}:ro\n",
-                tsvc_str, hp, cp
+                "  {}:\n    volumes:\n      - {}:{}:ro\n    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"team_id={},challenge={}\"\n",
+                tsvc_str, hp, cp, loki, team_id, challenge_name,
             ));
         }
     }
@@ -235,12 +249,6 @@ pub async fn up(
             .and_then(|v| v.first())
             .map(|(_, ip, _)| *ip)
             .unwrap_or(80);
-        // Per-instance compose projects are never joined to the main ctfd stack's
-        // network, so the `loki` container-name DNS used by Grafana's datasource
-        // doesn't resolve here — this always goes over loopback instead (reachable
-        // directly in single-machine mode, or via the primary→runner reverse SSH
-        // tunnel in split-machine mode; see the Ansible playbooks).
-        let loki = loki_url.unwrap_or("http://127.0.0.1:3100/loki/api/v1/push");
         override_content.push_str(&format!(
             "  proxy:\n    image: nervctf-proxy:latest\n    restart: unless-stopped\n    ports:\n      - \"{}:8080\"\n    environment:\n      - UPSTREAM=http://{}:{}\n      - TEAM_ID={}\n      - CHALLENGE_NAME={}\n      - LISTEN_PORT=8080\n    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"team_id={},challenge={}\"\n",
             host_port, svc_name, primary_internal_port, team_id, challenge_name, loki, team_id, challenge_name,

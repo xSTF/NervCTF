@@ -177,6 +177,12 @@ pub async fn provision(
             let app_port_mappings: &[(u16, u32, String)] =
                 if log_proxy { &port_mappings[1..] } else { &port_mappings };
 
+            // Every instance container (app and, if present, the proxy sidecar) ships its
+            // stdout/stderr to Loki with team/challenge labels — not just `log_proxy`-opted-in
+            // HTTP sidecars — so admins can see raw logs for any challenge (nc, ssh, …) on the
+            // "NervCTF Player Traffic" Grafana dashboard, filtered by challenge/team.
+            let loki = loki_url.unwrap_or("http://127.0.0.1:3100/loki/api/v1/push");
+
             let container_id = docker::run_container(
                 &image_tag,
                 &cname,
@@ -185,7 +191,7 @@ pub async fn provision(
                 &env_vars,
                 &volumes,
                 proxy_net.as_deref(),
-                &[],
+                &docker::loki_log_args(loki, team_id, challenge_name),
                 runner_ssh,
             ).await?;
 
@@ -198,7 +204,6 @@ pub async fn provision(
                     ("LISTEN_PORT".to_string(), "8080".to_string()),
                 ];
                 let proxy_port_mappings = vec![(host_port, 8080u32, "tcp".to_string())];
-                let loki = loki_url.unwrap_or("http://127.0.0.1:3100/loki/api/v1/push");
                 docker::run_container(
                     "nervctf-proxy:latest",
                     &proxy_name,
