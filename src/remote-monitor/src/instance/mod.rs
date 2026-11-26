@@ -24,6 +24,39 @@ fn effective_connection_type(connection: &str, primary_protocol: &str) -> String
     }
 }
 
+/// Whether this instance gets a log-proxy sidecar in front of it.
+///
+/// `log_proxy: true` applies only to `connection: http`, and only when the sidecar
+/// image is actually present on the host that runs challenge containers. The playbook
+/// builds `nervctf-proxy:latest` locally and only when `nervctf setup` found a
+/// `nervctf-proxy` binary to ship, so a deployment can legitimately not have it; the
+/// image is in no registry, so referencing it anyway fails the whole provision with a
+/// misleading "pull access denied" from Docker Hub. Warn and provision without the
+/// sidecar instead — the app container still ships stdout/stderr to Loki, so only the
+/// per-request HTTP access log is lost.
+async fn log_proxy_enabled(
+    connection: &str,
+    config: &Value,
+    challenge_name: &str,
+    runner_ssh: Option<&str>,
+) -> bool {
+    if connection != "http" || !config["log_proxy"].as_bool().unwrap_or(false) {
+        return false;
+    }
+    if docker::proxy_image_available(runner_ssh).await {
+        return true;
+    }
+    tracing::warn!(
+        "provision: '{}' sets log_proxy but image {} is missing on the challenge host — \
+         provisioning without the traffic-logging sidecar. To enable it, build the proxy \
+         (cargo build --release --target x86_64-unknown-linux-musl -p nervctf-proxy) and \
+         re-run `nervctf setup`.",
+        challenge_name,
+        docker::PROXY_IMAGE
+    );
+    false
+}
+
 /// Generate a random flag for `flag_mode = "random"`, or return None for static/no flag.
 pub fn generate_flag(config: &Value) -> Option<String> {
     if config["flag_mode"].as_str().unwrap_or("static") != "random" {
@@ -169,7 +202,8 @@ pub async fn provision(
             // The app container joins a dedicated per-instance network and is not
             // published directly; the sidecar is published on `host_port` instead and
             // forwards to the app by container name.
-            let log_proxy = connection == "http" && config["log_proxy"].as_bool().unwrap_or(false);
+            let log_proxy =
+                log_proxy_enabled(&connection, config, challenge_name, runner_ssh).await;
             let proxy_net = log_proxy.then(|| docker::proxy_network_name(&cname));
             if let Some(net) = &proxy_net {
                 docker::create_network(net, runner_ssh).await?;
@@ -210,7 +244,7 @@ pub async fn provision(
                 ];
                 let proxy_port_mappings = vec![(host_port, 8080u32, "tcp".to_string())];
                 docker::run_container(
-                    "nervctf-proxy:latest",
+                    docker::PROXY_IMAGE,
                     &proxy_name,
                     &proxy_port_mappings,
                     None,
@@ -318,7 +352,8 @@ pub async fn provision(
                     (map, svc_key.to_string(), hp, proto, port_mappings)
                 };
 
-            let log_proxy = connection == "http" && config["log_proxy"].as_bool().unwrap_or(false);
+            let log_proxy =
+                log_proxy_enabled(&connection, config, challenge_name, runner_ssh).await;
             let team_name = crate::db::get_identity_name(db, team_id, ctfd_mode).unwrap_or(None);
             let (_, project) = compose::up(
                 &compose_path,

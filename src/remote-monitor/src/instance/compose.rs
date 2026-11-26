@@ -7,6 +7,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 
+use super::docker;
 use super::ssh;
 
 /// Return the runner SSH target if configured (split-machine mode).
@@ -264,9 +265,14 @@ pub async fn up(
             .and_then(|v| v.first())
             .map(|(_, ip, _)| *ip)
             .unwrap_or(80);
+        // `pull_policy: never` because the image is built locally by the playbook and
+        // exists in no registry: without it compose tries Docker Hub when the image is
+        // absent and fails with a credentials error that hides the real cause. Callers
+        // already skip the sidecar in that case (`log_proxy_enabled`); this keeps a race
+        // or a hand-edited override honest about what is wrong.
         override_content.push_str(&format!(
-            "  proxy:\n    image: nervctf-proxy:latest\n    restart: unless-stopped\n    ports:\n      - \"{}:8080\"\n    environment:\n      - UPSTREAM=http://{}:{}\n      - TEAM_ID={}\n      - CHALLENGE_NAME={}\n      - LISTEN_PORT=8080\n    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"{}\"\n",
-            host_port, svc_name, primary_internal_port, team_id, challenge_name, loki, loki_labels,
+            "  proxy:\n    image: {}\n    pull_policy: never\n    restart: unless-stopped\n    ports:\n      - \"{}:8080\"\n    environment:\n      - UPSTREAM=http://{}:{}\n      - TEAM_ID={}\n      - CHALLENGE_NAME={}\n      - LISTEN_PORT=8080\n    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"{}\"\n",
+            docker::PROXY_IMAGE, host_port, svc_name, primary_internal_port, team_id, challenge_name, loki, loki_labels,
         ));
     }
 

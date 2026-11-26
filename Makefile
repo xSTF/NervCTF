@@ -41,10 +41,11 @@ help: ## Show this help message
 
 # ── Nix (dev build) ───────────────────────────────────────────────────────────
 
-release-nix: ## [Nix] Native release build — both binaries, no cross
+release-nix: ## [Nix] Native release build — all three binaries, no cross
 	$(NIX) cargo build --release
 	cp target/release/$(BINARY_A) .
 	cp target/release/$(BINARY_B) .
+	cp target/release/$(BINARY_C) .
 
 # ── Linux (both binaries) ─────────────────────────────────────────────────────
 
@@ -108,15 +109,19 @@ all-platforms: all release-macos release-macos-arm ## All targets — macOS requ
 
 # ── Install ───────────────────────────────────────────────────────────────────
 
-install: release-nix ## Install both binaries to /usr/local/bin (requires sudo)
+install: release-nix ## Install all three binaries to /usr/local/bin (requires sudo)
 	sudo install -m 755 $(BINARY_A) /usr/local/bin/$(BINARY_A)
 	sudo install -m 755 $(BINARY_B) /usr/local/bin/$(BINARY_B)
+	# nervctf finds the proxy binary next to its own exe (find_proxy_binary in
+	# setup.rs); omitting it here silently disables the log_proxy sidecar.
+	sudo install -m 755 $(BINARY_C) /usr/local/bin/$(BINARY_C)
 	@echo "Installed to /usr/local/bin/"
 
-install-user: release-nix ## Install both binaries to ~/.local/bin (no sudo required)
+install-user: release-nix ## Install all three binaries to ~/.local/bin (no sudo required)
 	@mkdir -p ~/.local/bin
 	install -m 755 $(BINARY_A) ~/.local/bin/$(BINARY_A)
 	install -m 755 $(BINARY_B) ~/.local/bin/$(BINARY_B)
+	install -m 755 $(BINARY_C) ~/.local/bin/$(BINARY_C)
 	@echo "Installed to ~/.local/bin/ — ensure this is in your PATH"
 
 # ── Dev helpers ───────────────────────────────────────────────────────────────
