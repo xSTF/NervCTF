@@ -606,6 +606,70 @@ def stop_instance():
 
 # ── Plugin entry point ────────────────────────────────────────────────────────
 
+def _default_index_content(event_name, event_description):
+    """The landing page body CTFd's own /setup flow would have written.
+
+    CTFd serves `/` from the Pages table (CTFd.views.static_html looks up the
+    page whose route is "index"). Upstream creates that row inside the /setup
+    view, so an instance set up programmatically — as NervCTF does below — has
+    `setup = true` and no index page, and every request to `/` answers 404.
+    """
+    import html
+
+    title = html.escape(event_name or "NervCTF")
+    description = html.escape(event_description or "")
+    description_block = (
+        '\n        <p class="text-center">{}</p>'.format(description) if description else ""
+    )
+    return """<div class="row">
+    <div class="col-md-6 offset-md-3">
+        <h1 class="text-center" style="padding-top: 10vh;">{title}</h1>{description_block}
+        <br>
+        <h4 class="text-center">
+            <a href="/challenges">Challenges</a> &middot;
+            <a href="/scoreboard">Scoreboard</a>
+        </h4>
+        <h5 class="text-center">
+            <a href="/admin">Log in as admin</a> to configure this CTF.
+        </h5>
+    </div>
+</div>""".format(title=title, description_block=description_block)
+
+
+def _ensure_index_page(event_name, event_description):
+    """Create the `index` page once, if this instance has none.
+
+    Called on every boot (not just first-run) so instances already set up by an
+    older plugin stop answering 404 on `/`. A marker config key records that the
+    page was created, so an admin who deletes it on purpose does not get it back
+    on the next restart.
+    """
+    try:
+        from CTFd.models import Configs, Pages, db
+    except Exception as exc:  # depends on the CTFd build
+        logger.warning("NervCTF index page unavailable: %s", exc)
+        return
+
+    marker = Configs.query.filter_by(key="nervctf_index_page_created").first()
+    if marker is not None and str(marker.value).lower() == "true":
+        return
+    if Pages.query.filter_by(route="index").first() is None:
+        page_fields = {
+            "title": None,
+            "route": "index",
+            "content": _default_index_content(event_name, event_description),
+            "draft": False,
+            "hidden": False,
+            "auth_required": False,
+        }
+        columns = {column.name for column in Pages.__table__.columns}
+        db.session.add(
+            Pages(**{k: v for k, v in page_fields.items() if k in columns})
+        )
+        logger.info("NervCTF created the CTFd index page")
+    db.session.add(Configs(key="nervctf_index_page_created", value="true"))
+
+
 def _maybe_complete_setup(app):
     """Create the first admin and write CTFd's base settings when the instance
     has not been set up yet.
@@ -631,6 +695,12 @@ def _maybe_complete_setup(app):
         with app.app_context():
             setup = Configs.query.filter_by(key="setup").first()
             if setup is not None and str(setup.value).lower() == "true":
+                # Nothing left to set up, but an instance set up by an earlier
+                # plugin version can still be missing its index page.
+                _ensure_index_page(
+                    event_name, os.environ.get("NERVCTF_EVENT_DESCRIPTION", "")
+                )
+                db.session.commit()
                 return
             if Users.query.filter_by(name=admin_user).first() is None:
                 # Detect how this build stores passwords. Some CTFd builds hash
@@ -684,6 +754,9 @@ def _maybe_complete_setup(app):
                     db.session.add(Configs(key=key, value=value))
                 else:
                     row.value = value
+            _ensure_index_page(
+                event_name, os.environ.get("NERVCTF_EVENT_DESCRIPTION", "")
+            )
             db.session.commit()
             logger.info("NervCTF completed CTFd first-run setup (admin=%s)", admin_user)
     except Exception as exc:

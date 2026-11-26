@@ -952,11 +952,24 @@
       become_user: "{{ docker_user }}"
 
     # Wait for CTFd's gunicorn workers to finish db.create_all() / Alembic migrations.
-    # A non-502/503 HTTP response means at least one gunicorn worker has completed its
-    # create_app() call and the schema is ready.
+    # Any routed HTTP response means at least one gunicorn worker has completed its
+    # create_app() call and the schema is ready; only a connection error or a
+    # 502/503 from the proxy means it is still booting.
+    #
+    # Probe /setup, not /: /setup answers 200 before first-run setup and 302 once
+    # `setup` is true, so it is routed in both states. / is served from the Pages
+    # table and answers 404 on a freshly set-up instance that has no index page
+    # yet, which used to stall this loop for all 60 retries even though CTFd was
+    # up.
+    #
+    # 404 is deliberately NOT accepted. /setup is a registered route in every
+    # state, so a 404 means something other than CTFd answered: the port lookup
+    # above falls back to 80 when `docker compose port` comes back empty, and a
+    # host nginx on :80 returns 404 here. Accepting it would report "ready"
+    # against the wrong server and push the real failure into `nervctf deploy`.
     - name: Wait for CTFd to finish database initialization
       uri:
-        url: "http://localhost:{{ ctfd_http_port.stdout | trim }}/"
+        url: "http://localhost:{{ ctfd_http_port.stdout | trim }}/setup"
         status_code: [200, 301, 302, 401, 403]
         follow_redirects: no
         timeout: 10
