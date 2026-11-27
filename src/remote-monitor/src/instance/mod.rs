@@ -82,10 +82,35 @@ pub fn capture_mode(config: &Value) -> CaptureMode {
 /// ships stdout/stderr to Loki. (A tap that fails to start *after* the app has been
 /// left unpublished is a different case — there the provision is torn down, because
 /// the instance would be unreachable.)
-async fn tap_enabled(config: &Value, challenge_name: &str, runner_ssh: Option<&str>) -> bool {
+async fn tap_enabled(
+    config: &Value,
+    challenge_name: &str,
+    capture_dir: &str,
+    runner_ssh: Option<&str>,
+) -> bool {
     if capture_mode(config) != CaptureMode::Tap {
         return false;
     }
+
+    // The capture directory is checked here, not at launch time, because the tap
+    // bind-mounts it: if the directory cannot be created, `docker run` fails with
+    // "error while creating mount source path ... permission denied" and the whole
+    // provision dies. Docker will not create it for us when the parent is unwritable,
+    // so leniency at launch time does not help — the decision has to be made before
+    // the app container's port is withheld, while degrading still leaves a working
+    // instance.
+    if let Err(e) = docker::ensure_dir(capture_dir, runner_ssh).await {
+        tracing::warn!(
+            "provision: '{}' asks for capture but the capture directory {} is not usable \
+             ({}) — provisioning WITHOUT capture. Is CAPTURE_BASE_DIR mounted read-write \
+             into the monitor?",
+            challenge_name,
+            capture_dir,
+            e
+        );
+        return false;
+    }
+
     if docker::tap_image_available(runner_ssh).await {
         return true;
     }
@@ -250,7 +275,8 @@ pub async fn provision(
             // container joins a dedicated per-instance network and is not published
             // directly; the tap is published on `host_port` instead and forwards to the
             // app by container name.
-            let tap = tap_enabled(config, challenge_name, runner_ssh).await;
+            let cap_dir = docker::capture_dir(&cname);
+            let tap = tap_enabled(config, challenge_name, &cap_dir, runner_ssh).await;
             let tap_net = tap.then(|| docker::instance_network_name(&cname));
             if let Some(net) = &tap_net {
                 docker::create_network(net, runner_ssh).await?;
@@ -282,7 +308,6 @@ pub async fn provision(
 
             if tap {
                 let tap_name = docker::tap_container_name(&cname);
-                let cap_dir = docker::capture_dir(&cname);
                 // The primary port's protocol decides whether the tap listens TCP or UDP.
                 let (primary_internal, primary_proto) =
                     (internal_ports[0].0, port_mappings[0].2.clone());
@@ -307,7 +332,6 @@ pub async fn provision(
                 // the provision rather than leaving a running instance nobody can connect
                 // to (the old proxy path left exactly that behind).
                 let tap_result = async {
-                    docker::ensure_dir(&cap_dir, runner_ssh).await?;
                     docker::run_container(
                         docker::TAP_IMAGE,
                         &tap_name,
@@ -433,11 +457,12 @@ pub async fn provision(
             let team_name = crate::db::get_identity_name(db, team_id, ctfd_mode).unwrap_or(None);
             // The primary service's first port decides the tap's protocol, matching the
             // docker backend. `primary_protocol` is already resolved above.
-            let tap_spec = tap_enabled(config, challenge_name, runner_ssh)
+            let compose_cap_dir = docker::capture_dir(&project_name);
+            let tap_spec = tap_enabled(config, challenge_name, &compose_cap_dir, runner_ssh)
                 .await
                 .then(|| compose::TapSpec {
                     proto: primary_protocol.clone(),
-                    capture_dir: docker::capture_dir(&project_name),
+                    capture_dir: compose_cap_dir.clone(),
                     instance_id: project_name.clone(),
                 });
             let (_, project) = compose::up(

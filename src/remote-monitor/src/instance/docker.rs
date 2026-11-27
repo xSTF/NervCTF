@@ -725,6 +725,83 @@ mod tests {
         assert!(!out.status.success(), "network {} still exists", net);
     }
 
+    /// Regression guard for the incident that took six live challenges down.
+    ///
+    /// The monitor mounted CAPTURE_BASE_DIR read-only, so creating the per-instance
+    /// capture directory failed with EROFS and every challenge asking for capture
+    /// stopped provisioning. Two facts this pins down:
+    ///
+    ///   * `ensure_dir` reports the failure rather than hiding it, so the decision to
+    ///     degrade can be made *before* the app container's port is withheld.
+    ///   * Docker will not rescue a bad mount source: launching the tap against an
+    ///     uncreatable directory fails the `docker run` outright, which is why leniency
+    ///     at launch time is not a fix.
+    #[tokio::test]
+    #[ignore = "requires Docker + nervctf-tap:latest"]
+    async fn an_unusable_capture_dir_is_detected_before_launch() {
+        use std::collections::HashSet;
+
+        let base = std::env::var("NERVCTF_TEST_CAPTURE_DIR").unwrap_or_else(|_| {
+            std::env::temp_dir().join("nervctf-tap-it").display().to_string()
+        });
+        let locked = std::path::Path::new(&base).join("locked-ro");
+        let _ = std::fs::create_dir_all(&locked);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+                .expect("lock the dir");
+        }
+        std::env::set_var("CAPTURE_BASE_DIR", locked.display().to_string());
+
+        let cname = format!("nervctf-ro-{}", std::process::id());
+        let cap = capture_dir(&cname);
+
+        // 1. The failure is surfaced, not swallowed — this is what lets `tap_enabled`
+        //    choose to provision without capture while the instance is still publishable.
+        let pre_create = ensure_dir(&cap, None).await;
+        assert!(
+            pre_create.is_err(),
+            "an unwritable capture dir must be reported so the caller can degrade"
+        );
+
+        // 2. Proof that degrading is the only workable response: with the directory
+        //    uncreatable, the tap cannot be launched at all.
+        let net = instance_network_name(&cname);
+        let tap_name = tap_container_name(&cname);
+        let _ = remove_container(&cname, None).await;
+        create_network(&net, None).await.expect("create network");
+        let host_port = pick_free_ports(&HashSet::new(), 1).expect("pick port")[0];
+        let launched = run_container(
+            TAP_IMAGE,
+            &tap_name,
+            &[(host_port, 8080u32, "tcp".to_string())],
+            None,
+            &tap_env(&cname, 4000, "tcp", 1, None, "ro-chal", &cname),
+            &[],
+            Some(&net),
+            &capture_mount_args(&cap),
+            None,
+        )
+        .await;
+
+        let _ = remove_container(&cname, None).await;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&locked);
+        }
+
+        let err = launched.expect_err("the tap must not start with an uncreatable mount source");
+        assert!(
+            err.to_string().contains("mount source path")
+                || err.to_string().to_lowercase().contains("permission denied"),
+            "unexpected failure: {}",
+            err
+        );
+    }
+
     #[test]
     fn capture_mount_is_read_write() {
         // The recorder writes here, so this must NOT carry `:ro` the way the

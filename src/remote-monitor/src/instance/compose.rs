@@ -364,8 +364,20 @@ pub async fn up(
             .and_then(|v| v.first())
             .map(|(_, ip, _)| *ip)
             .unwrap_or(80);
-        // Created before `compose up` so the bind mount is not auto-created root-owned.
-        super::docker::ensure_dir(&spec.capture_dir, effective_target.as_deref()).await?;
+        // Best-effort, exactly as in the docker backend: if this fails (read-only
+        // mount, full disk) the tap creates `/cap` itself on startup and Docker creates
+        // the host side of the bind mount, so capture still works. Failing the whole
+        // `compose up` over a capture directory would let a capture problem take a
+        // challenge down, which this design does not allow.
+        if let Err(e) =
+            super::docker::ensure_dir(&spec.capture_dir, effective_target.as_deref()).await
+        {
+            tracing::warn!(
+                "compose: could not pre-create capture dir {} ({}); the tap will create it",
+                spec.capture_dir,
+                e
+            );
+        }
         override_content.push_str(&tap_service_block(
             spec,
             svc_name,
