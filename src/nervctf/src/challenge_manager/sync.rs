@@ -247,6 +247,8 @@ mod tests {
             flag_file_path: None,
             flag_service: None,
             service_ports: None,
+            capture: None,
+            log_proxy: false,
         }
     }
 

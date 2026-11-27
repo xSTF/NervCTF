@@ -89,9 +89,9 @@ instance:
 
   connection: nc              # nc | http | ssh — ignored for display when the primary
                               # port is UDP: players always see 'nc -u host port' then.
-  log_proxy: false            # http only. Opt-in traffic-logging sidecar — see
-                              # "HTTP traffic logging" below before enabling; it can
-                              # break WebSocket/streaming/raw-HTTP-semantics challenges.
+  capture: off                # off | tap. Records player traffic via a byte-transparent
+                              # sidecar — see "Traffic capture" below. Any protocol, not
+                              # just http. The superseded `log_proxy: true` means `tap`.
   command: null               # override the container entrypoint or CMD
   timeout_minutes: 45
   max_renewals: 3
@@ -396,44 +396,109 @@ The `nervctf_instance` plugin also adds a panel inside the CTFd challenge page t
 
 ---
 
-## HTTP traffic logging (`log_proxy`)
+## Traffic capture (`capture`)
 
-`log_proxy: true` in the `instance:` block opts one `connection: http` challenge into an
-HTTP-proxy sidecar (`nervctf-proxy`) so admins can review what players actually sent —
-useful for flag-sharing and exploit-reuse detection. **Off by default, and only meaningful
-with `connection: http`** — set it on a specific challenge, not globally.
+`capture:` in the `instance:` block controls whether player traffic to an instance is
+recorded for review — the basis for flag-sharing and exploit-reuse detection.
 
-**Do not enable `log_proxy` for a challenge whose puzzle is HTTP behavior itself.** The
-sidecar re-terminates HTTP: it fully buffers request/response bodies in memory (no size
-cap — organizers should expect proportional memory use on large uploads), has no
-WebSocket/`Upgrade` handling, and normalizes raw protocol quirks through its own
-client/server stack. This will alter or break challenges built around WebSockets,
-SSE/long-polling, HTTP request smuggling, raw socket timing, or non-standard methods. For
-everything else — typical web apps (Flask/Node/etc.) — it's a safe, zero-code-change way to
-see exactly what was sent.
+| Value | Behaviour |
+|---|---|
+| `tap` | An `nervctf-tap` sidecar is placed in the data path. It relays bytes verbatim and records the raw stream to disk. |
+| `off` | No capture. The instance is published directly — identical to an instance with no sidecar. |
+| `pcap` | Reserved for out-of-path packet capture. **Not implemented**; the validator rejects it. |
 
-**Docker backend**: when enabled, the app container joins a per-instance bridge network and
-is not published directly; the sidecar is published on the player-facing host port instead
-and forwards to the app by container name. **Compose backend**: the primary service's
-`ports:` entry is replaced by a `proxy:` service in the per-instance override, forwarding to
-the primary service by compose's built-in service-name DNS. Multi-port http instances are
-proxied on their primary port only; any additional ports stay published directly. When
-`log_proxy` is unset (or `connection` isn't `http`), none of this applies — behavior is
-identical to a plain instance with no sidecar at all.
+Unset defaults to `off`, **except** that the superseded `log_proxy: true` resolves to
+`tap`. Existing challenge files keep working unchanged and are upgraded to the tap
+automatically; new challenges should use `capture:`.
 
-The sidecar logs one JSON line per request/response (method, path, headers, body) to its
-own stdout, tagged with `team_id`/`challenge` labels, and ships it straight to Loki via
-Docker's `loki` logging-driver plugin — nothing is read from disk on demand. Request/response
-bodies are capped at 2 KB per log line (`req_body_truncated`/`resp_body_truncated` flags mark
-when a body was cut); full-body-dependent challenges should not enable `log_proxy` in the
-first place (see the warning above).
+```yaml
+instance:
+  backend: docker
+  internal_ports: [8080]
+  connection: http
+  capture: tap
+```
 
-**Viewing it**: open Grafana (`http://<host>:3000`, see `nervctf setup`'s printed access info)
-and go to the **NervCTF Player Traffic** dashboard. It's templated on `$challenge` and
-`$team_id` and renders each request as a table row (method/path/status/duration) parsed out of
-the JSON log line — expand a row's `Line` field for the full entry (headers, body preview).
-Non-`log_proxy` instances have nothing here; their output is whatever the app itself printed,
-visible only via plain `docker logs`/`docker compose logs` on the host.
+### Why a tap and not an HTTP proxy
+
+The tap replaces `nervctf-proxy`, which re-terminated HTTP in order to log it. That
+approach restricted capture to `connection: http` and broke any challenge whose puzzle
+was HTTP behaviour itself. The tap interprets **no** application protocol: it copies
+bytes in both directions, propagates half-close, preserves datagram boundaries, and
+records the stream for decoding later, at read time.
+
+Consequences:
+
+- **It works for every protocol.** `nc`, raw TCP, UDP, SSH, TLS, HTTP/1.1, HTTP/2 and
+  WebSockets are all captured identically. `capture: tap` is no longer tied to
+  `connection: http`, so an `nc` challenge with `log_proxy: true` now gets captured
+  instead of silently getting nothing.
+- **It does not alter the exchange.** Headers are not rewritten or collapsed, bodies are
+  not buffered to completion, there is no request size limit, and time-to-first-byte is
+  unaffected — so streaming, SSE, long-polling and `Upgrade` all behave as they do
+  without it.
+- **Capture limits never throttle a player.** Recording is non-blocking: if the writer
+  falls behind, frames are dropped and counted rather than stalling the connection. Past
+  `MAX_SESSION_BYTES` or the instance budget, recording stops and relaying continues.
+
+### The one thing it does change
+
+The challenge sees the **tap's** address as the client, not the player's. A challenge
+that rate-limits, ACLs or shards by source IP will behave differently behind a tap.
+Use `capture: off` for those (`pcap`, once implemented, will capture out of path and
+avoid this entirely). The tap itself does record the real client IP for every session.
+
+Timing-wise the tap adds one in-host hop, sub-millisecond, with Nagle disabled on both
+legs so interactive and timing-sensitive challenges are not re-batched.
+
+### How it is wired
+
+**Docker backend**: the app container joins a per-instance bridge network and is not
+published; the tap is published on the player-facing host port and relays to the app by
+container name. If the tap fails to start, the app container is torn down and the
+provision fails, rather than leaving a running instance nobody can reach.
+
+**Compose backend**: the primary service's `ports:` entry is replaced by a `tap:` service
+in the per-instance override, relaying to the primary service by compose's service-name
+DNS. A UDP primary port publishes the tap as `/udp`.
+
+Only the **primary** port is tapped. Additional ports on a multi-port instance stay
+published directly and are not captured; the validator warns when that applies.
+
+Only the `docker` and `compose` backends support capture. `lxc` and `vagrant` instances
+run uncaptured, and the validator warns if one asks for `tap`.
+
+### Where captures go
+
+Each session is written to `/var/lib/nervctf-captures/<instance>/`:
+
+- `index.jsonl` — one JSON record per session lifecycle event (`open`, `close`), carrying
+  client IP, byte counts per direction, duration, drop/cap flags, and `fp_c2s` (a
+  fingerprint of the opening client bytes, for correlating identical payloads across teams).
+- `<session>.ntap` — the framed raw byte stream.
+
+Read one on the host with the tap binary itself:
+
+```sh
+nervctf-tap dump /var/lib/nervctf-captures/<instance>/<session>.ntap
+nervctf-tap dump --raw=c2s /var/lib/nervctf-captures/<instance>/<session>.ntap > sent.bin
+```
+
+Captures are **not** deleted when an instance is torn down — they are the evidence an
+integrity review runs on. Retention is the operator's call; cap the disk and purge after
+the event. Recording player traffic at byte level should be stated in the event rules.
+
+In split-machine mode the capture files land on the **runner** host. The monitor mounts
+the capture directory only in single-machine mode; reading captures over SSH is not
+wired up yet.
+
+### What is not in Grafana
+
+Capture bytes are deliberately not shipped to Loki — base64 inflates them, per-session
+labels would explode cardinality, and a byte stream in a log panel is unreadable. Grafana's
+**NervCTF Container Logs** dashboard shows instance container *stdout/stderr* (whatever the
+challenge itself printed, which for many `nc`/pwn challenges is nothing). Request/response
+inspection is a session-browsing problem and belongs over the capture files.
 
 In split-machine mode, the runner host's Docker daemon (which does the actual Loki push, from
 its own network namespace) reaches Loki on the primary host over loopback through a

@@ -34,6 +34,7 @@ The CLI never calls CTFd's HTTP API directly. Every CLI operation goes to the mo
 | `users` | SELECT, INSERT (first admin only) | `token, banned, hidden, team_id, id, name, type` | Token auth, name cache, and the plugin's first-run admin creation |
 | `teams` | SELECT | `id, name` | Team name cache |
 | `submissions` | SELECT (read-only) | `team_id, user_id, challenge_id, date, type` | Solve sync; only `type='correct'` rows are read |
+| `submissions` | SELECT (read-only) | `ip, provided` | **Grafana only** (NervCTF Integrity dashboard, MySQL datasource) — not read by remote-monitor. Shared-IP and duplicate-wrong-flag detection |
 | `configs` / `config` | SELECT, INSERT, UPDATE | `key, value, type` | Event settings from `nervctf event`; `user_mode` and `ctf_version` are read by the probe. The monitor auto-detects which table name the build uses. |
 
 ### Tables accessed conditionally (schema-detected at runtime)

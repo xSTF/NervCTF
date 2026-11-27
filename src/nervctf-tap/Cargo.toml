@@ -1,0 +1,16 @@
+[package]
+name = "nervctf-tap"
+version = "2.8.0"
+edition = "2021"
+
+[[bin]]
+name = "nervctf-tap"
+path = "src/main.rs"
+
+# Deliberately minimal: the tap never parses an application protocol, so it needs
+# no HTTP client/server stack at all (the `nervctf-proxy` it replaces pulled in
+# axum + reqwest + h2 + hyper for exactly that reason).
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
+serde_json = "1.0"
+anyhow = "1.0"

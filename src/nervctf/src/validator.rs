@@ -322,11 +322,41 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                             ));
                         }
                     }
-                    if inst.log_proxy && inst.connection != "http" {
+                    // Capture mode. `log_proxy: true` now resolves to `capture: tap`,
+                    // and the tap is protocol-agnostic, so the old "only works with
+                    // connection: http" warning no longer applies to any backend that
+                    // supports a sidecar.
+                    use crate::ctfd_api::models::{CaptureMode, InstanceBackend};
+                    let capture = inst.capture_mode();
+
+                    if inst.capture == Some(CaptureMode::Pcap) {
+                        issues.push(Issue::error(
+                            name,
+                            "instance.capture",
+                            "'pcap' is not implemented yet — use 'tap' for in-path capture or 'off' for none",
+                        ));
+                    }
+                    if inst.capture.is_some() && inst.log_proxy {
                         issues.push(Issue::warn(
                             name,
-                            "instance.log_proxy",
-                            "set but connection is not 'http' — log_proxy only applies to HTTP instances and has no effect here; raw `docker logs` are already available for any instance",
+                            "instance.capture",
+                            "both `capture` and the superseded `log_proxy` are set — `capture` wins; drop `log_proxy`",
+                        ));
+                    }
+                    if capture == CaptureMode::Tap
+                        && !matches!(inst.backend, InstanceBackend::Docker | InstanceBackend::Compose)
+                    {
+                        issues.push(Issue::warn(
+                            name,
+                            "instance.capture",
+                            "capture is only wired for the docker and compose backends — this instance will run with no capture",
+                        ));
+                    }
+                    if capture == CaptureMode::Tap && inst.internal_ports.len() > 1 {
+                        issues.push(Issue::warn(
+                            name,
+                            "instance.capture",
+                            "only the primary port is tapped — the remaining ports are published directly and will not be captured",
                         ));
                     }
                     // timeout_minutes: 0 means instances would expire instantly
@@ -584,7 +614,7 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
         "vagrantfile", "internal_port", "internal_ports", "connection",
         "timeout_minutes", "max_renewals", "command", "flag_mode", "flag_prefix",
         "flag_suffix", "random_flag_length", "flag_delivery", "flag_file_path",
-        "flag_service", "service_ports", "log_proxy",
+        "flag_service", "service_ports", "log_proxy", "capture",
     ];
     for key in &c.unknown_yaml_keys {
         if INSTANCE_ONLY_KEYS.contains(&key.as_str()) {
@@ -687,6 +717,14 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
                 frow(FW, "instance.backend", Some(&format!("{:?}", inst.backend).to_lowercase()), fi("instance.backend"));
                 frow(FW, "instance.internal_ports", ports_s.as_deref(), fi("instance.internal_ports"));
                 frow(FW, "instance.connection", Some(&inst.connection), fi("instance.connection"));
+                // Shows the *resolved* mode, so a challenge still using `log_proxy: true`
+                // displays the `tap` it will actually get.
+                frow(
+                    FW,
+                    "instance.capture",
+                    Some(&format!("{:?}", inst.capture_mode()).to_lowercase()),
+                    fi("instance.capture"),
+                );
                 if let Some(img) = &inst.image {
                     frow(FW, "instance.image", Some(img.as_str()), fi("instance.image"));
                 } else {
@@ -927,6 +965,7 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
         "instance", "instance.backend", "instance.internal_ports", "instance.connection",
         "instance.image", "instance.compose_file", "instance.compose_service", "instance.service_ports",
         "instance.lxc_image", "instance.vagrantfile",
+        "instance.capture", "instance.log_proxy",
         "instance.flag_mode", "instance.flag_delivery", "instance.flag_file_path",
         "instance.flag_service", "instance.flag_prefix", "instance.flag_suffix",
         "instance.random_flag_length", "instance.timeout_minutes", "instance.max_renewals",

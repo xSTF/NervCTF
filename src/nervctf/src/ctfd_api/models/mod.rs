@@ -217,6 +217,28 @@ pub enum FlagDelivery {
     File,
 }
 
+/// How player traffic to an instance is captured.
+///
+/// `Tap` puts an `nervctf-tap` sidecar in the data path: a byte-transparent L4
+/// relay that records the raw stream and interprets nothing, so it is safe for any
+/// protocol (`nc`, raw TCP/UDP, SSH, TLS, HTTP, WebSockets). It replaces the old
+/// `nervctf-proxy`, which had to re-terminate HTTP in order to log it.
+///
+/// The tap's one observable difference from a direct publish is that the challenge
+/// sees the tap's address as the client, not the player's. A challenge that rate-limits
+/// or ACLs by source IP should use `Pcap`, which captures out of path.
+#[derive(Debug, Deserialize, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureMode {
+    /// In-path L4 tap sidecar (default for challenges that set `log_proxy: true`).
+    Tap,
+    /// Out-of-path packet capture. Reserved — not implemented yet; the validator
+    /// rejects it rather than silently capturing nothing.
+    Pcap,
+    /// No capture. The instance is published directly, exactly as before.
+    Off,
+}
+
 #[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct InstanceConfig {
     pub backend: InstanceBackend,
@@ -263,12 +285,32 @@ pub struct InstanceConfig {
     /// Mutually exclusive with `internal_ports` (validator warns if both set).
     #[serde(default)]
     pub service_ports: Option<std::collections::HashMap<String, Vec<PortSpec>>>,
-    /// Opt-in HTTP traffic-logging sidecar (only meaningful with `connection: http`).
-    /// Off by default — re-terminates HTTP through our own proxy, which can alter or
-    /// break challenges whose puzzle is HTTP behavior itself (WebSockets, streaming,
-    /// request smuggling, raw socket timing). See docs/instance-challenges.md.
+    /// Traffic capture mode. Unset falls back to `log_proxy` — see `capture_mode`.
+    #[serde(default)]
+    pub capture: Option<CaptureMode>,
+    /// Superseded by `capture`. Kept so existing `challenge.yml` files keep working:
+    /// `log_proxy: true` now resolves to `capture: tap`.
+    ///
+    /// Unlike the old HTTP proxy this no longer requires `connection: http` — the tap
+    /// is protocol-agnostic, so an `nc` challenge with `log_proxy: true` now gets
+    /// captured instead of silently getting nothing.
     #[serde(default)]
     pub log_proxy: bool,
+}
+
+impl InstanceConfig {
+    /// Effective capture mode: explicit `capture` wins, else legacy `log_proxy: true`
+    /// means `Tap`, else `Off`.
+    ///
+    /// `Off` is the default for a challenge that sets neither, so adding the tap does
+    /// not change the data path of any instance that had not already opted in.
+    pub fn capture_mode(&self) -> CaptureMode {
+        self.capture.unwrap_or(if self.log_proxy {
+            CaptureMode::Tap
+        } else {
+            CaptureMode::Off
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]

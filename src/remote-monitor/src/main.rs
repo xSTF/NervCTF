@@ -2,6 +2,8 @@
 //!
 //! Routes:
 //!   GET  /health                         — liveness check (no auth)
+//!   GET  /api/v1/admin/integrity         — integrity findings (monitor token)
+//!   GET  /metrics                        — Prometheus text-format metrics (no auth)
 //!   GET  /admin                          — admin dashboard (monitor token via ?token= or header)
 //!   GET  /instance/:name                 — HTML player page
 //!   ANY  /api/v1/diff                    — local/remote diff (monitor token)
@@ -99,6 +101,13 @@ struct AppState {
     /// mode's interpretation, so flipping it mid-event would orphan existing rows.
     /// A genuine CTFd mode change requires a monitor restart to take effect.
     ctfd_mode: ctfd_db::CtfdMode,
+    /// `/metrics` counters — instance provisioning attempts by outcome.
+    provision_success: Arc<std::sync::atomic::AtomicU64>,
+    provision_failure: Arc<std::sync::atomic::AtomicU64>,
+    /// Configured `MAX_CONCURRENT_PROVISIONS`, exposed via `/metrics` alongside
+    /// `provision_sem.available_permits()` for a queue-saturation gauge — `Semaphore`
+    /// has no capacity getter, so this is tracked separately.
+    provision_capacity: usize,
 }
 
 #[tokio::main]
@@ -238,6 +247,9 @@ async fn main() -> Result<()> {
         provision_sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent_provisions)),
         max_instances_per_team,
         ctfd_mode,
+        provision_success: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        provision_failure: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        provision_capacity: max_concurrent_provisions,
     });
 
     // Spawn background CTFd solve sync task (read-only from MariaDB → SQLite cache)
@@ -355,6 +367,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/", get(login_page_handler))
         .route("/auth/login", post(auth_login_handler))
         .route("/auth/logout", post(auth_logout_handler))
@@ -388,6 +401,7 @@ async fn main() -> Result<()> {
         .route("/api/v1/admin/instances", get(admin_instances_handler))
         .route("/api/v1/admin/attempts", get(admin_attempts_handler))
         .route("/api/v1/admin/solves", get(admin_solves_handler))
+        .route("/api/v1/admin/integrity", get(admin_integrity_handler))
         .route("/api/v1/admin/config", get(admin_config_handler))
         .route("/api/v1/admin/probe", get(admin_probe_handler))
         .route("/api/v1/admin/tokens", get(list_tokens_handler).post(create_token_handler))
@@ -500,6 +514,44 @@ async fn validate_ctfd_token(
 
 async fn health_handler() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
+}
+
+/// Hand-rolled Prometheus text exposition format — no metrics crate in the dependency
+/// tree, and the metric set here is small and fixed enough not to warrant adding one.
+/// Unauthenticated, same as `/health`: there's no router-level auth layer to slot into
+/// (every other handler checks auth inline), and a standard Prometheus scrape_config
+/// can't easily send a bearer token anyway.
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let success = state.provision_success.load(std::sync::atomic::Ordering::Relaxed);
+    let failure = state.provision_failure.load(std::sync::atomic::Ordering::Relaxed);
+    let by_status = db::count_instances_by_status(&state.db).unwrap_or_default();
+    let running = by_status.iter().find(|(s, _)| s == "running").map(|(_, n)| *n).unwrap_or(0);
+    let provisioning = by_status.iter().find(|(s, _)| s == "provisioning").map(|(_, n)| *n).unwrap_or(0);
+    let available = state.provision_sem.available_permits();
+
+    let body = format!(
+        "# HELP nervctf_provision_total Instance provisioning attempts by outcome\n\
+         # TYPE nervctf_provision_total counter\n\
+         nervctf_provision_total{{result=\"success\"}} {success}\n\
+         nervctf_provision_total{{result=\"failure\"}} {failure}\n\
+         # HELP nervctf_active_instances Instances currently in each status\n\
+         # TYPE nervctf_active_instances gauge\n\
+         nervctf_active_instances{{status=\"running\"}} {running}\n\
+         nervctf_active_instances{{status=\"provisioning\"}} {provisioning}\n\
+         # HELP nervctf_provision_queue_available Free provisioning semaphore permits\n\
+         # TYPE nervctf_provision_queue_available gauge\n\
+         nervctf_provision_queue_available {available}\n\
+         # HELP nervctf_provision_queue_capacity Configured max concurrent provisions\n\
+         # TYPE nervctf_provision_queue_capacity gauge\n\
+         nervctf_provision_queue_capacity {capacity}\n",
+        capacity = state.provision_capacity,
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; version=0.0.4")
+        .body(body)
+        .unwrap_or_else(|_| Response::new(String::new()))
 }
 
 // ── Instance HTML page ────────────────────────────────────────────────────────
@@ -1203,9 +1255,11 @@ async fn instance_request_handler(
             state_bg.ctfd_mode,
         ).await {
             Ok((host, port, conn, _exp)) => {
+                state_bg.provision_success.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!("provision_bg (player): done {}:{} ({}) for '{}' team {}", host, port, conn, challenge_name_bg, team_id);
             }
             Err(e) => {
+                state_bg.provision_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 error!("provision_bg (player): '{}' team {} error: {}", challenge_name_bg, team_id, e);
                 let _ = db::delete_instance(&state_bg.db, &challenge_name_bg, team_id);
             }
@@ -1523,9 +1577,11 @@ async fn plugin_request_handler(
             state_bg.ctfd_mode,
         ).await {
             Ok((host, port, conn, _exp)) => {
+                state_bg.provision_success.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!("provision_bg: done {}:{} ({}) for '{}' team {}", host, port, conn, challenge_name_bg, team_id_bg);
             }
             Err(e) => {
+                state_bg.provision_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 error!("provision_bg: '{}' team {} error: {}", challenge_name_bg, team_id_bg, e);
                 // Remove the stub so the client can retry
                 let _ = db::delete_instance(&state_bg.db, &challenge_name_bg, team_id_bg);
@@ -2164,6 +2220,24 @@ async fn admin_attempts_handler(
     let result = tokio::task::spawn_blocking(move || {
         if alerts_only { db::list_sharing_alerts(&db) } else { db::list_flag_attempts(&db, i64::MAX) }
     }).await;
+    match result {
+        Ok(Ok(list)) => Json(json!(list)).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// Integrity findings for the Grafana "NervCTF Integrity" dashboard (Infinity
+/// datasource) and for operators reviewing an event. Read-only.
+async fn admin_integrity_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_any_auth(&headers, &state.db).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+    let db = Arc::clone(&state.db);
+    let result = tokio::task::spawn_blocking(move || db::list_integrity_findings(&db)).await;
     match result {
         Ok(Ok(list)) => Json(json!(list)).into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),

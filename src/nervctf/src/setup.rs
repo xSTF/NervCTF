@@ -158,14 +158,14 @@ fn find_monitor_binary() -> Option<PathBuf> {
     None
 }
 
-fn find_proxy_binary() -> Option<PathBuf> {
+fn find_tap_binary() -> Option<PathBuf> {
     // Names to search for, in preference order (musl static first — no interpreter issues)
     const NAMES: &[&str] = &[
-        "nervctf-proxy",
-        "nervctf-proxy-linux-x86_64-static",
-        "nervctf-proxy-linux-x86_64",
-        "nervctf-proxy-linux-aarch64-static",
-        "nervctf-proxy-linux-aarch64",
+        "nervctf-tap",
+        "nervctf-tap-linux-x86_64-static",
+        "nervctf-tap-linux-x86_64",
+        "nervctf-tap-linux-aarch64-static",
+        "nervctf-tap-linux-aarch64",
     ];
 
     // 1. Next to the running nervctf exe (covers dist/ when user runs dist/nervctf-*)
@@ -190,9 +190,9 @@ fn find_proxy_binary() -> Option<PathBuf> {
         for profile in &["release", "debug"] {
             for target in &targets {
                 let candidate = if target.is_empty() {
-                    root.join("target").join(profile).join("nervctf-proxy")
+                    root.join("target").join(profile).join("nervctf-tap")
                 } else {
-                    root.join("target").join(target).join(profile).join("nervctf-proxy")
+                    root.join("target").join(target).join(profile).join("nervctf-tap")
                 };
                 if candidate.exists() {
                     return Some(candidate);
@@ -690,14 +690,15 @@ pub fn run_setup() -> Result<()> {
         None => println!("  [!] CTFd plugin not found -- plugin will not be deployed."),
     }
 
-    // ── Find nervctf-proxy binary (HTTP traffic-logging sidecar) ──────────────
-    let proxy_binary = find_proxy_binary();
-    match &proxy_binary {
-        Some(p) => println!("  Found nervctf-proxy binary: {}", p.display()),
+    // ── Find nervctf-tap binary (instance traffic-capture sidecar) ────────────
+    let tap_binary = find_tap_binary();
+    match &tap_binary {
+        Some(p) => println!("  Found nervctf-tap binary: {}", p.display()),
         None => println!(
-            "  [!] nervctf-proxy binary not found -- connection: http instances will run \
-             without the traffic-logging sidecar. Build it with:\n\
-             cargo build --release --target x86_64-unknown-linux-musl -p nervctf-proxy"
+            "  [!] nervctf-tap binary not found -- instances that ask for capture \
+             (capture: tap, or the superseded log_proxy: true) will FAIL to provision. \
+             Build it with:\n\
+             cargo build --release --target x86_64-unknown-linux-musl -p nervctf-tap"
         ),
     }
 
@@ -716,8 +717,8 @@ pub fn run_setup() -> Result<()> {
     if let Some(ref plugin) = plugin_src {
         evars.push(format!("plugin_src={}", plugin.display()));
     }
-    if let Some(ref bin) = proxy_binary {
-        evars.push(format!("proxy_binary={}", bin.display()));
+    if let Some(ref bin) = tap_binary {
+        evars.push(format!("tap_binary={}", bin.display()));
     }
     if let Some(ref rip) = runner_ip {
         evars.push(format!("runner_ip={}", rip));
@@ -762,9 +763,9 @@ pub fn run_setup() -> Result<()> {
         println!("   cargo build --release --target x86_64-unknown-linux-musl -p remote-monitor");
         println!("   Then re-run `nervctf setup` to deploy it.");
     }
-    if proxy_binary.is_none() {
-        println!("\n[!] remember to build and deploy nervctf-proxy for HTTP instance traffic logging:");
-        println!("   cargo build --release --target x86_64-unknown-linux-musl -p nervctf-proxy");
+    if tap_binary.is_none() {
+        println!("\n[!] remember to build and deploy nervctf-tap for instance traffic capture:");
+        println!("   cargo build --release --target x86_64-unknown-linux-musl -p nervctf-tap");
         println!("   Then re-run `nervctf setup` to deploy it.");
     }
     // Grafana (host resource monitoring via Prometheus/node-exporter) is always installed.
@@ -914,7 +915,7 @@ pub fn run_upgrade() -> Result<()> {
     // ── Find local artifacts ───────────────────────────────────────────────────
     let monitor_binary = find_monitor_binary();
     let plugin_src = find_plugin_src();
-    let proxy_binary = find_proxy_binary();
+    let tap_binary = find_tap_binary();
 
     if monitor_binary.is_none() && plugin_src.is_none() {
         return Err(anyhow!(
@@ -934,9 +935,9 @@ pub fn run_upgrade() -> Result<()> {
         Some(p) => println!("CTFd plugin:    {}", p.display()),
         None     => println!("[!] CTFd plugin not found — skipping plugin upgrade"),
     }
-    match &proxy_binary {
-        Some(p) => println!("Proxy binary:   {}", p.display()),
-        None     => println!("[!] nervctf-proxy binary not found — skipping traffic-logging sidecar upgrade"),
+    match &tap_binary {
+        Some(p) => println!("Tap binary:     {}", p.display()),
+        None     => println!("[!] nervctf-tap binary not found — skipping traffic-capture sidecar upgrade"),
     }
 
     println!();
@@ -962,8 +963,8 @@ pub fn run_upgrade() -> Result<()> {
     if let Some(ref plugin) = plugin_src {
         evars.push(format!("plugin_src={}", plugin.display()));
     }
-    if let Some(ref bin) = proxy_binary {
-        evars.push(format!("proxy_binary={}", bin.display()));
+    if let Some(ref bin) = tap_binary {
+        evars.push(format!("tap_binary={}", bin.display()));
     }
     // Pass runner vars so the upgrade playbook can write the correct
     // RUNNER_SSH_TARGET / CHALLENGES_BASE_DIR into the docker-compose override.

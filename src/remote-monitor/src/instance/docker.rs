@@ -255,20 +255,110 @@ pub async fn run_container(
     Ok(container_name.to_string())
 }
 
-/// Deterministic per-instance network name for an HTTP-proxied instance, derived from
-/// the app container's name so cleanup needs no extra DB state.
-pub fn proxy_network_name(container_name: &str) -> String {
+/// Deterministic per-instance network name for a captured instance, derived from the
+/// app container's name so cleanup needs no extra DB state.
+pub fn instance_network_name(container_name: &str) -> String {
     format!("{}-net", container_name)
 }
 
-/// Deterministic sidecar proxy container name for an HTTP-proxied instance.
-pub fn proxy_container_name(container_name: &str) -> String {
+/// Deterministic sidecar name for the `nervctf-tap` fronting a captured instance.
+pub fn tap_container_name(container_name: &str) -> String {
+    format!("{}-tap", container_name)
+}
+
+/// Legacy `nervctf-proxy` sidecar name. Only used by cleanup, so an instance
+/// provisioned by an older build is still torn down completely after an upgrade.
+pub fn legacy_proxy_container_name(container_name: &str) -> String {
     format!("{}-proxy", container_name)
 }
 
+/// Host directory holding `nervctf-tap` captures, mounted into the monitor at the
+/// same path so no path translation is needed (same convention as `/tmp/ctf-flags`).
+pub fn capture_base_dir() -> String {
+    std::env::var("CAPTURE_BASE_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/var/lib/nervctf-captures".to_string())
+}
+
+/// Per-instance capture directory. Deliberately *not* removed by `remove_container`:
+/// captures are the evidence an integrity review runs on, so they have to outlive the
+/// instance. Purging them is a separate retention policy.
+pub fn capture_dir(container_name: &str) -> String {
+    format!(
+        "{}/{}",
+        capture_base_dir().trim_end_matches('/'),
+        container_name
+    )
+}
+
+/// `mkdir -p` on whichever host will run the container, so a bind-mounted capture
+/// directory exists before `docker run` (Docker would otherwise create it root-owned).
+pub async fn ensure_dir(path: &str, runner_ssh: Option<&str>) -> Result<()> {
+    if let Some(target) = runner_ssh {
+        let output = ssh_output(target, &format!("mkdir -p '{}' && chmod 0777 '{}'", path, path))
+            .await
+            .map_err(|e| anyhow!("ssh mkdir {}: {}", path, e))?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "ssh mkdir {} failed: {}",
+                path,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    } else {
+        std::fs::create_dir_all(path).map_err(|e| anyhow!("create dir {}: {}", path, e))?;
+        // The tap container runs as its own uid; 0777 matches the project's existing
+        // posture for operator-firewalled, host-local state (see the Grafana/Loki
+        // data dirs in the playbook) rather than mapping uids per challenge image.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777));
+        }
+    }
+    Ok(())
+}
+
+/// Environment for a tap sidecar fronting `upstream_host:upstream_port`.
+///
+/// Pure so the exact contract between the monitor and the tap binary is unit-testable:
+/// a typo in one of these keys would silently mislabel every capture.
+pub fn tap_env(
+    upstream_host: &str,
+    upstream_port: u32,
+    proto: &str,
+    team_id: i64,
+    team_name: Option<&str>,
+    challenge_name: &str,
+    instance_id: &str,
+) -> Vec<(String, String)> {
+    vec![
+        // No scheme: the tap is a byte relay, not an HTTP client.
+        ("UPSTREAM".to_string(), format!("{}:{}", upstream_host, upstream_port)),
+        ("PROTO".to_string(), proto.to_string()),
+        ("LISTEN_PORT".to_string(), "8080".to_string()),
+        ("TEAM_ID".to_string(), team_id.to_string()),
+        // Stripped even though `docker run -e` passes these as argv (no shell, so not
+        // injectable here): `team_name` is player-chosen, and a newline in it has no
+        // business reaching capture index records.
+        ("TEAM_NAME".to_string(), super::strip_control(team_name.unwrap_or(""))),
+        ("CHALLENGE_NAME".to_string(), super::strip_control(challenge_name)),
+        ("INSTANCE_ID".to_string(), super::strip_control(instance_id)),
+        ("CAPTURE_DIR".to_string(), "/cap".to_string()),
+    ]
+}
+
+/// Extra `docker run` flags for a tap sidecar: its capture directory, read-write.
+/// Passed as raw args rather than through `run_container`'s `volumes`, which appends
+/// `:ro` — correct for flag files, wrong for a recorder.
+pub fn capture_mount_args(host_dir: &str) -> Vec<String> {
+    vec!["-v".to_string(), format!("{}:/cap", host_dir)]
+}
+
 /// Create a user-defined bridge network for one instance, so the app container and
-/// its HTTP-proxy sidecar can reach each other by name. Best-effort: only used for
-/// `connection: http` docker-backend instances.
+/// its tap sidecar can reach each other by name. Only used for captured
+/// docker-backend instances.
 pub async fn create_network(name: &str, runner_ssh: Option<&str>) -> Result<()> {
     let cmd = format!("docker network create '{}'", name);
     let output = if let Some(target) = runner_ssh {
@@ -319,30 +409,37 @@ pub async fn remove_container(container_id: &str, runner_ssh: Option<&str>) -> R
         let _ = std::fs::remove_file(&flag_path);
     }
 
-    // Best-effort HTTP-proxy sidecar cleanup. No-op for instances that never had one
-    // (names derived deterministically — see `proxy_container_name`/`proxy_network_name`
-    // — so there's no extra DB state to track whether a given instance used a proxy).
-    let proxy_name = proxy_container_name(container_id);
-    if let Some(target) = runner_ssh {
-        let _ = ssh_output(target, &format!("docker rm -f '{}'", proxy_name)).await;
-    } else {
-        let _ = tokio::process::Command::new("docker")
-            .args(["rm", "-f", &proxy_name])
-            .output()
-            .await;
+    // Best-effort sidecar cleanup. No-op for instances that never had one (names are
+    // derived deterministically — see `tap_container_name`/`instance_network_name` — so
+    // there's no extra DB state to track whether a given instance was captured).
+    // The legacy `-proxy` name is included so instances provisioned by a pre-tap build
+    // are still fully removed after an upgrade.
+    for sidecar in [
+        tap_container_name(container_id),
+        legacy_proxy_container_name(container_id),
+    ] {
+        if let Some(target) = runner_ssh {
+            let _ = ssh_output(target, &format!("docker rm -f '{}'", sidecar)).await;
+        } else {
+            let _ = tokio::process::Command::new("docker")
+                .args(["rm", "-f", &sidecar])
+                .output()
+                .await;
+        }
     }
-    remove_network(&proxy_network_name(container_id), runner_ssh).await;
-
-    if let Some(target) = runner_ssh {
+    // Remove the app container *before* its network: Docker refuses to delete a
+    // network that still has an attached endpoint. The previous order (network first)
+    // meant every captured instance leaked its `<name>-net` network.
+    let app_removal: Result<()> = if let Some(target) = runner_ssh {
         // Stop + remove on runner
         let _ = ssh_output(target, &format!("docker stop --time 3 '{}'", container_id)).await;
-        let output = ssh_output(target, &format!("docker rm -f '{}'", container_id)).await
-            .map_err(|e| anyhow!("ssh docker rm failed: {}", e))?;
-        if !output.status.success() {
-            return Err(anyhow!(
+        match ssh_output(target, &format!("docker rm -f '{}'", container_id)).await {
+            Err(e) => Err(anyhow!("ssh docker rm failed: {}", e)),
+            Ok(output) if !output.status.success() => Err(anyhow!(
                 "docker rm failed: {}",
                 String::from_utf8_lossy(&output.stderr)
-            ));
+            )),
+            Ok(_) => Ok(()),
         }
     } else {
         // Stop with a short grace period (3s) before SIGKILL — best effort
@@ -351,20 +448,25 @@ pub async fn remove_container(container_id: &str, runner_ssh: Option<&str>) -> R
             .output()
             .await;
 
-        let output = tokio::process::Command::new("docker")
+        match tokio::process::Command::new("docker")
             .args(["rm", "-f", container_id])
             .output()
             .await
-            .map_err(|e| anyhow!("docker rm failed: {}", e))?;
-
-        if !output.status.success() {
-            return Err(anyhow!(
+        {
+            Err(e) => Err(anyhow!("docker rm failed: {}", e)),
+            Ok(output) if !output.status.success() => Err(anyhow!(
                 "docker rm failed: {}",
                 String::from_utf8_lossy(&output.stderr)
-            ));
+            )),
+            Ok(_) => Ok(()),
         }
-    }
-    Ok(())
+    };
+
+    // Attempted even when the container removal failed, so a partially torn-down
+    // instance does not leave the network behind as well. Best-effort by design.
+    remove_network(&instance_network_name(container_id), runner_ssh).await;
+
+    app_removal
 }
 
 /// Build a Docker image from a tar.gz build context stored on disk.
@@ -402,4 +504,205 @@ pub async fn build_image(tar_path: &std::path::Path, image_tag: &str, runner_ssh
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_and_capture_paths_are_derived_from_the_container_name() {
+        assert_eq!(instance_network_name("ctf-web-t7"), "ctf-web-t7-net");
+        assert_eq!(tap_container_name("ctf-web-t7"), "ctf-web-t7-tap");
+        // Still derivable so an instance from a pre-tap build is fully torn down.
+        assert_eq!(legacy_proxy_container_name("ctf-web-t7"), "ctf-web-t7-proxy");
+    }
+
+    #[test]
+    fn tap_env_matches_the_binary_contract() {
+        let env = tap_env("app-c", 4000, "tcp", 42, Some("team_42"), "my-chal", "app-c");
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing env var {}", k))
+        };
+        // No scheme — nervctf-proxy took a URL here; a byte relay must not.
+        assert_eq!(get("UPSTREAM"), "app-c:4000");
+        assert_eq!(get("PROTO"), "tcp");
+        assert_eq!(get("LISTEN_PORT"), "8080");
+        assert_eq!(get("TEAM_ID"), "42");
+        assert_eq!(get("TEAM_NAME"), "team_42");
+        assert_eq!(get("CHALLENGE_NAME"), "my-chal");
+        assert_eq!(get("INSTANCE_ID"), "app-c");
+        assert_eq!(get("CAPTURE_DIR"), "/cap");
+    }
+
+    #[test]
+    fn tap_env_tolerates_an_unknown_team_name() {
+        let env = tap_env("app-c", 9999, "udp", 1, None, "c", "i");
+        assert!(env.iter().any(|(k, v)| k == "TEAM_NAME" && v.is_empty()));
+        assert!(env.iter().any(|(k, v)| k == "PROTO" && v == "udp"));
+    }
+
+    /// End-to-end exercise of the docker-backend capture path using the real
+    /// `create_network` / `run_container` / `remove_container` functions: app container
+    /// unpublished on a private network, tap published in front of it, captures landing
+    /// on disk, and the whole lot torn down afterwards.
+    ///
+    /// Ignored by default — needs a working Docker daemon, the `nervctf-tap:latest`
+    /// image, and `python:3.12-alpine`. Run with:
+    ///   `cargo test -p remote-monitor -- --ignored --nocapture tap_sidecar`
+    /// Set `NERVCTF_TEST_CAPTURE_DIR` to a path your Docker daemon can bind-mount
+    /// (required on Docker Desktop, where the default temp dir is not shared).
+    #[tokio::test]
+    #[ignore = "requires Docker + nervctf-tap:latest"]
+    async fn tap_sidecar_fronts_a_docker_instance_and_records_it() {
+        use std::collections::HashSet;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let base = std::env::var("NERVCTF_TEST_CAPTURE_DIR").unwrap_or_else(|_| {
+            std::env::temp_dir()
+                .join("nervctf-tap-it")
+                .display()
+                .to_string()
+        });
+        std::env::set_var("CAPTURE_BASE_DIR", &base);
+
+        let cname = format!("nervctf-it-{}", std::process::id());
+        let net = instance_network_name(&cname);
+        let tap_name = tap_container_name(&cname);
+        let cap = capture_dir(&cname);
+
+        // Clean slate, in case a previous run died mid-test.
+        let _ = remove_container(&cname, None).await;
+
+        create_network(&net, None).await.expect("create network");
+
+        // App container: deliberately NO port mappings — exactly how `provision`
+        // launches it when a tap is in front, so if the tap is not reachable the
+        // instance is not reachable at all and this test fails loudly.
+        run_container(
+            "python:3.12-alpine",
+            &cname,
+            &[],
+            Some("python -m http.server 4000"),
+            &[],
+            &[],
+            Some(&net),
+            &[],
+            None,
+        )
+        .await
+        .expect("run app container");
+
+        ensure_dir(&cap, None).await.expect("ensure capture dir");
+        let host_port = pick_free_ports(&HashSet::new(), 1).expect("pick port")[0];
+        let env = tap_env(&cname, 4000, "tcp", 42, Some("team_42"), "it-chal", &cname);
+        let extra = capture_mount_args(&cap);
+
+        run_container(
+            "nervctf-tap:latest",
+            &tap_name,
+            &[(host_port, 8080u32, "tcp".to_string())],
+            None,
+            &env,
+            &[],
+            Some(&net),
+            &extra,
+            None,
+        )
+        .await
+        .expect("run tap sidecar");
+
+        // Reach the app *through* the tap.
+        let mut body = String::new();
+        let mut last_err = String::new();
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            match tokio::net::TcpStream::connect(("127.0.0.1", host_port)).await {
+                Ok(mut sock) => {
+                    if sock
+                        .write_all(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let mut buf = Vec::new();
+                    if sock.read_to_end(&mut buf).await.is_ok() && !buf.is_empty() {
+                        body = String::from_utf8_lossy(&buf).to_string();
+                        break;
+                    }
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        assert!(
+            body.starts_with("HTTP/1.0 200"),
+            "no 200 through the tap (last connect error: {}); got: {:?}",
+            last_err,
+            body.chars().take(120).collect::<String>()
+        );
+
+        // The session must have been recorded, with the labels the monitor passed in.
+        let index = std::path::Path::new(&cap).join("index.jsonl");
+        let mut records = String::new();
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Ok(c) = std::fs::read_to_string(&index) {
+                if c.contains("\"close\"") {
+                    records = c;
+                    break;
+                }
+            }
+        }
+        assert!(
+            !records.is_empty(),
+            "no close record in {}",
+            index.display()
+        );
+        let close: serde_json::Value = records
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["ev"] == "close")
+            .expect("a close record");
+        assert_eq!(close["challenge"], "it-chal");
+        assert_eq!(close["team_name"], "team_42");
+        assert_eq!(close["team_id"], "42");
+        assert_eq!(close["instance"], cname.as_str());
+        assert!(
+            close["bytes_c2s"].as_u64().unwrap_or(0) > 0
+                && close["bytes_s2c"].as_u64().unwrap_or(0) > 0,
+            "both directions should have bytes: {}",
+            close
+        );
+        assert_eq!(close["dropped_frames"].as_u64(), Some(0));
+
+        // Teardown must remove the sidecar and the private network too.
+        remove_container(&cname, None).await.expect("remove app");
+        for name in [&cname, &tap_name] {
+            let out = tokio::process::Command::new("docker")
+                .args(["inspect", name])
+                .output()
+                .await
+                .expect("docker inspect");
+            assert!(!out.status.success(), "{} still exists after teardown", name);
+        }
+        let out = tokio::process::Command::new("docker")
+            .args(["network", "inspect", &net])
+            .output()
+            .await
+            .expect("docker network inspect");
+        assert!(!out.status.success(), "network {} still exists", net);
+    }
+
+    #[test]
+    fn capture_mount_is_read_write() {
+        // The recorder writes here, so this must NOT carry `:ro` the way the
+        // flag-file mounts in `run_container` do.
+        let args = capture_mount_args("/var/lib/nervctf-captures/x");
+        assert_eq!(args, vec!["-v".to_string(), "/var/lib/nervctf-captures/x:/cap".to_string()]);
+        assert!(!args.iter().any(|a| a.ends_with(":ro")));
+    }
 }

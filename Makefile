@@ -16,7 +16,7 @@
 
 BINARY_A  := nervctf
 BINARY_B  := remote-monitor
-BINARY_C  := nervctf-proxy
+BINARY_C  := nervctf-tap
 
 NIX := nix develop .\# --command
 

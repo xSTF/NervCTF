@@ -115,44 +115,52 @@
       become_user: "{{ docker_user }}"
       when: monitor_binary is defined
 
-    # ── nervctf-proxy binary + Docker image (HTTP instance traffic-logging sidecar) ─
-    - name: Ensure nervctf-proxy directory exists
+    # ── nervctf-tap binary + Docker image (instance traffic-capture sidecar) ──
+    # Replaces nervctf-proxy. Already-running instances keep their old proxy sidecar
+    # until they expire; remove_container tears down both the `-tap` and legacy
+    # `-proxy` sidecar names, so no instance is left half-removed after this upgrade.
+    - name: Ensure nervctf-tap directory exists
       file:
-        path: "{{ ctfd_path }}/nervctf-proxy"
+        path: "{{ ctfd_path }}/nervctf-tap"
         state: directory
         owner: "{{ docker_user }}"
         group: docker
         mode: "0755"
-      when: proxy_binary is defined
+      when: tap_binary is defined
 
-    - name: Copy updated nervctf-proxy binary
+    - name: Copy updated nervctf-tap binary
       copy:
-        src: "{{ proxy_binary }}"
-        dest: "{{ ctfd_path }}/nervctf-proxy/nervctf-proxy"
+        src: "{{ tap_binary }}"
+        dest: "{{ ctfd_path }}/nervctf-tap/nervctf-tap"
         owner: "{{ docker_user }}"
         group: docker
         mode: "0755"
-      when: proxy_binary is defined
+      when: tap_binary is defined
 
-    # NOTE: This Dockerfile is duplicated in nervctf_playbook.yml — keep them in sync.
-    - name: Write nervctf-proxy Dockerfile
+    # NOTE: duplicated in nervctf_playbook.yml and src/nervctf-tap/Dockerfile —
+    # keep all three in sync.
+    - name: Write nervctf-tap Dockerfile
       copy:
         content: |
           FROM debian:bookworm-slim
-          RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
-              rm -rf /var/lib/apt/lists/*
-          COPY nervctf-proxy /usr/local/bin/nervctf-proxy
-          ENTRYPOINT ["/usr/local/bin/nervctf-proxy"]
-        dest: "{{ ctfd_path }}/nervctf-proxy/Dockerfile"
+          COPY nervctf-tap /usr/local/bin/nervctf-tap
+          ENTRYPOINT ["/usr/local/bin/nervctf-tap"]
+        dest: "{{ ctfd_path }}/nervctf-tap/Dockerfile"
         owner: "{{ docker_user }}"
         group: docker
         mode: "0644"
-      when: proxy_binary is defined
+      when: tap_binary is defined
 
-    - name: Rebuild nervctf-proxy Docker image
-      command: docker build -t nervctf-proxy:latest {{ ctfd_path }}/nervctf-proxy
+    - name: Rebuild nervctf-tap Docker image
+      command: docker build -t nervctf-tap:latest {{ ctfd_path }}/nervctf-tap
       become_user: "{{ docker_user }}"
-      when: proxy_binary is defined
+      when: tap_binary is defined
+
+    - name: Ensure nervctf capture directory exists
+      file:
+        path: /var/lib/nervctf-captures
+        state: directory
+        mode: "0777"
 
     # ── Grafana/Prometheus/Loki data directories (host resource monitoring +
     #    opt-in log_proxy player-traffic logging) ────────────────────────────────
@@ -234,6 +242,9 @@
             - job_name: node
               static_configs:
                 - targets: ["node-exporter:9100"]
+            - job_name: remote-monitor
+              static_configs:
+                - targets: ["remote-monitor:{{ monitor_port }}"]
         dest: "{{ ctfd_path }}/prometheus/prometheus.yml"
         owner: "{{ docker_user }}"
         group: docker
@@ -385,13 +396,22 @@
         group: docker
         mode: "0644"
 
-    # ── NervCTF Player Traffic dashboard (opt-in log_proxy challenges only) ─────
-    - name: Write NervCTF player-traffic dashboard
+    # ── NervCTF Container Logs dashboard ───────────────────────────────────────
+    # Was "Player Traffic", built around nervctf-proxy's per-request JSON lines. The
+    # tap that replaces the proxy writes raw byte streams to disk, not to Loki, so the
+    # old `| json | status >= 400` and `unwrap duration_ms` panels referenced fields
+    # that no longer exist anywhere and would render permanently empty.
+    #
+    # What Loki genuinely holds is every instance container's stdout/stderr, labelled
+    # by challenge/team — which is log-shaped, so that is all this dashboard claims to
+    # show. Request/response inspection is a session-browsing problem and belongs in
+    # remote-monitor's admin UI, over the tap's capture files.
+    - name: Write NervCTF container-logs dashboard
       copy:
         content: |
           {
-            "title": "NervCTF Player Traffic",
-            "uid": "nervctf-player-traffic",
+            "title": "NervCTF Container Logs",
+            "uid": "nervctf-container-logs",
             "schemaVersion": 39,
             "editable": true,
             "time": { "from": "now-1h", "to": "now" },
@@ -424,63 +444,433 @@
                   "refresh": 2,
                   "includeAll": true,
                   "multi": true
+                },
+                {
+                  "name": "search",
+                  "type": "textbox",
+                  "label": "Filter (substring)",
+                  "query": "",
+                  "current": { "text": "", "value": "" }
                 }
               ]
             },
             "panels": [
               {
                 "id": 1,
-                "title": "Requests",
-                "type": "table",
-                "gridPos": { "h": 16, "w": 24, "x": 0, "y": 0 },
+                "title": "What this shows",
+                "type": "text",
+                "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+                "options": {
+                  "mode": "markdown",
+                  "content": "Container **stdout/stderr** for every instance, labelled by challenge and team. This is whatever the challenge itself printed \u2014 many challenges (nc, pwn) print nothing.\n\nFor what players actually **sent and received**, use the tap's capture files via remote-monitor's admin UI; those bytes are deliberately not shipped here."
+                }
+              },
+              {
+                "id": 2,
+                "title": "Instance Logs",
+                "type": "logs",
+                "gridPos": { "h": 15, "w": 24, "x": 0, "y": 3 },
                 "datasource": { "type": "loki", "uid": "loki" },
-                "transformations": [
-                  {
-                    "id": "organize",
-                    "options": {
-                      "excludeByName": {
-                        "Time": false, "challenge": true, "team_id": true, "Line": true,
-                        "tsNs": true, "id": true, "labels": true,
-                        "req_headers": true, "resp_headers": true,
-                        "req_body_b64": true, "resp_body_b64": true,
-                        "req_body_len": true, "resp_body_len": true,
-                        "req_body_truncated": true, "resp_body_truncated": true,
-                        "ts_ms": true
-                      },
-                      "indexByName": { "Time": 0, "team_name": 1, "method": 2, "path": 3, "status": 4, "duration_ms": 5 },
-                      "renameByName": {
-                        "team_name": "Team", "method": "Method", "path": "Path", "status": "Status",
-                        "duration_ms": "Duration (ms)"
-                      }
-                    }
-                  }
-                ],
+                "options": {
+                  "showTime": true,
+                  "showLabels": true,
+                  "wrapLogMessage": true,
+                  "sortOrder": "Descending"
+                },
                 "targets": [
                   {
                     "datasource": { "type": "loki", "uid": "loki" },
-                    "expr": "{challenge=~\"$challenge\", team_id=~\"$team_id\", team_name=~\"$team_name\"} | json",
+                    "expr": "{challenge=~\"$challenge\", team_id=~\"$team_id\", team_name=~\"$team_name\"} |= \"$search\"",
                     "queryType": "range"
                   }
                 ]
               },
               {
-                "id": 2,
-                "title": "Raw Container Logs",
-                "type": "logs",
-                "gridPos": { "h": 12, "w": 24, "x": 0, "y": 16 },
+                "id": 3,
+                "title": "Log Volume by Challenge",
+                "type": "timeseries",
+                "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
                 "datasource": { "type": "loki", "uid": "loki" },
-                "options": { "showTime": true, "wrapLogMessage": true, "sortOrder": "Descending" },
                 "targets": [
                   {
                     "datasource": { "type": "loki", "uid": "loki" },
-                    "expr": "{challenge=~\"$challenge\", team_id=~\"$team_id\", team_name=~\"$team_name\"}",
+                    "expr": "sum by (challenge) (count_over_time({challenge=~\"$challenge\", team_id=~\"$team_id\", team_name=~\"$team_name\"}[$__interval]))",
+                    "queryType": "range"
+                  }
+                ]
+              },
+              {
+                "id": 4,
+                "title": "Loudest Teams (lines)",
+                "type": "timeseries",
+                "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+                "datasource": { "type": "loki", "uid": "loki" },
+                "targets": [
+                  {
+                    "datasource": { "type": "loki", "uid": "loki" },
+                    "expr": "topk(10, sum by (team_name) (count_over_time({challenge=~\"$challenge\", team_id=~\"$team_id\", team_name=~\"$team_name\"}[$__interval])))",
                     "queryType": "range"
                   }
                 ]
               }
             ]
           }
-        dest: "{{ ctfd_path }}/grafana/provisioning/dashboards/player-traffic.json"
+        dest: "{{ ctfd_path }}/grafana/provisioning/dashboards/container-logs.json"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    # Remove the superseded dashboard so Grafana stops provisioning panels that query
+    # nervctf-proxy fields no longer produced by anything.
+    - name: Remove superseded player-traffic dashboard
+      file:
+        path: "{{ ctfd_path }}/grafana/provisioning/dashboards/player-traffic.json"
+        state: absent
+
+    - name: Write NervCTF scoreboard dashboard
+      copy:
+        content: |
+          {
+            "title": "NervCTF Scoreboard",
+            "uid": "nervctf-scoreboard",
+            "schemaVersion": 39,
+            "editable": true,
+            "time": { "from": "now-6h", "to": "now" },
+            "refresh": "30s",
+            "panels": [
+              {
+                "id": 1,
+                "title": "Team-mode only",
+                "type": "text",
+                "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+                "options": {
+                  "mode": "markdown",
+                  "content": "This dashboard assumes CTFd team-mode. A user-mode deployment (`submissions.team_id` is always NULL there) will show empty panels — see the user-mode comments in `ctfd_db.rs` for the join pattern a user-mode variant would need."
+                }
+              },
+              {
+                "id": 2,
+                "title": "Cumulative Solves Over Time",
+                "type": "timeseries",
+                "gridPos": { "h": 10, "w": 24, "x": 0, "y": 3 },
+                "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                "targets": [
+                  {
+                    "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                    "rawSql": "SELECT s.date AS time, t.name AS metric, COUNT(*) OVER (PARTITION BY t.id ORDER BY s.date) AS value FROM submissions s JOIN teams t ON t.id = s.team_id WHERE s.type = 'correct' AND t.hidden = 0 AND t.banned = 0 AND $__timeFilter(s.date) ORDER BY s.date",
+                    "format": "time_series",
+                    "rawQuery": true
+                  }
+                ]
+              },
+              {
+                "id": 3,
+                "title": "First Blood",
+                "type": "table",
+                "gridPos": { "h": 10, "w": 12, "x": 0, "y": 13 },
+                "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                "targets": [
+                  {
+                    "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                    "rawSql": "SELECT c.name AS challenge, t.name AS first_blood_team, first.ts AS solved_at FROM (SELECT challenge_id, team_id, MIN(date) AS ts FROM submissions WHERE type = 'correct' GROUP BY challenge_id) first JOIN challenges c ON c.id = first.challenge_id JOIN teams t ON t.id = first.team_id WHERE t.hidden = 0 AND t.banned = 0 ORDER BY first.ts ASC",
+                    "format": "table",
+                    "rawQuery": true
+                  }
+                ]
+              },
+              {
+                "id": 4,
+                "title": "Challenge Difficulty",
+                "type": "table",
+                "gridPos": { "h": 10, "w": 12, "x": 12, "y": 13 },
+                "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                "targets": [
+                  {
+                    "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                    "rawSql": "SELECT c.name AS challenge, c.value AS current_value, COUNT(DISTINCT s.team_id) AS solves, (SELECT COUNT(*) FROM teams WHERE hidden = 0 AND banned = 0) AS total_teams, ROUND(100.0 * COUNT(DISTINCT s.team_id) / NULLIF((SELECT COUNT(*) FROM teams WHERE hidden = 0 AND banned = 0), 0), 1) AS solve_rate_pct FROM challenges c LEFT JOIN submissions s ON s.challenge_id = c.id AND s.type = 'correct' LEFT JOIN teams t ON t.id = s.team_id AND t.hidden = 0 AND t.banned = 0 GROUP BY c.id, c.name, c.value ORDER BY solve_rate_pct ASC",
+                    "format": "table",
+                    "rawQuery": true
+                  }
+                ]
+              }
+            ]
+          }
+        dest: "{{ ctfd_path }}/grafana/provisioning/dashboards/scoreboard.json"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    - name: Write NervCTF admin-ops dashboard
+      copy:
+        content: |
+          {
+            "title": "NervCTF Admin Ops",
+            "uid": "nervctf-admin-ops",
+            "schemaVersion": 39,
+            "editable": true,
+            "time": { "from": "now-6h", "to": "now" },
+            "refresh": "30s",
+            "panels": [
+              {
+                "id": 1,
+                "title": "Flag-Sharing Alerts",
+                "type": "table",
+                "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+                "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                "targets": [
+                  {
+                    "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                    "type": "json",
+                    "source": "url",
+                    "format": "table",
+                    "url": "/api/v1/admin/attempts?alerts_only=true",
+                    "url_options": { "method": "GET" },
+                    "root_selector": "$"
+                  }
+                ]
+              },
+              {
+                "id": 2,
+                "title": "Active Instances",
+                "type": "table",
+                "gridPos": { "h": 10, "w": 24, "x": 0, "y": 10 },
+                "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                "targets": [
+                  {
+                    "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                    "type": "json",
+                    "source": "url",
+                    "format": "table",
+                    "url": "/api/v1/admin/instances",
+                    "url_options": { "method": "GET" },
+                    "root_selector": "$"
+                  }
+                ]
+              },
+              {
+                "id": 3,
+                "title": "Event Timeline",
+                "type": "table",
+                "gridPos": { "h": 10, "w": 24, "x": 0, "y": 20 },
+                "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                "targets": [
+                  {
+                    "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                    "type": "json",
+                    "source": "url",
+                    "format": "table",
+                    "url": "/api/v1/admin/events?limit=200",
+                    "url_options": { "method": "GET" },
+                    "root_selector": "$.data"
+                  }
+                ]
+              }
+            ]
+          }
+        dest: "{{ ctfd_path }}/grafana/provisioning/dashboards/admin-ops.json"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    # ── NervCTF Integrity dashboard ────────────────────────────────────────────
+    # The anti-cheat view. Every panel runs on data that already exists — the
+    # monitor's own event log and CTFd's `submissions` table — so none of it depends
+    # on traffic capture being enabled, and it covers standard challenges too.
+    #
+    # Ranked roughly by signal-to-noise: the monitor's own findings first (it knows
+    # which flag belongs to which team's instance, so those are near-certain), then
+    # the CTFd-derived heuristics, which need an operator's judgement.
+    - name: Write NervCTF integrity dashboard
+      copy:
+        content: |
+          {
+            "title": "NervCTF Integrity",
+            "uid": "nervctf-integrity",
+            "schemaVersion": 39,
+            "editable": true,
+            "time": { "from": "now-24h", "to": "now" },
+            "refresh": "1m",
+            "panels": [
+              {
+                "id": 1,
+                "title": "How to read this",
+                "type": "text",
+                "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
+                "options": {
+                  "mode": "markdown",
+                  "content": "Panels are ordered by confidence, strongest first.\n\n**Near-certain** (monitor-derived, each instance has a unique flag): *Foreign flag submitted* and *Solved without an instance*. A team cannot solve an instance challenge it was never given an instance of.\n\n**Needs judgement** (CTFd-derived heuristics): the rest. Known false positives \u2014 shared IPs are normal behind one NAT, campus network or VPN; simultaneous solves cluster at challenge release; a challenge converted from standard to instance mid-event will show spurious *Solved without an instance* rows. Confirm before accusing anyone.\n\nTeam-mode only. In CTFd user-mode `submissions.team_id` is NULL and the CTFd-derived panels will be empty."
+                }
+              },
+              {
+                "id": 2,
+                "title": "Foreign flag submitted (near-certain)",
+                "description": "A team submitted a flag that belongs to another team's instance. The monitor generates a unique flag per instance, so this is direct evidence of sharing.",
+                "type": "table",
+                "gridPos": { "h": 9, "w": 24, "x": 0, "y": 6 },
+                "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                "targets": [
+                  {
+                    "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                    "type": "json",
+                    "source": "url",
+                    "format": "table",
+                    "url": "/api/v1/admin/attempts?alerts_only=true",
+                    "url_options": { "method": "GET" },
+                    "root_selector": "$"
+                  }
+                ]
+              },
+              {
+                "id": 3,
+                "title": "Solved without an instance (near-certain)",
+                "description": "Correct solve for an instance challenge with no instance.requested event for that team, or a solve timestamped before their first request. There was nothing for them to solve.",
+                "type": "table",
+                "gridPos": { "h": 9, "w": 24, "x": 0, "y": 15 },
+                "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                "targets": [
+                  {
+                    "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                    "type": "json",
+                    "source": "url",
+                    "format": "table",
+                    "url": "/api/v1/admin/integrity",
+                    "url_options": { "method": "GET" },
+                    "root_selector": "$"
+                  }
+                ]
+              },
+              {
+                "id": 4,
+                "title": "Same wrong flag submitted by multiple teams",
+                "description": "Two teams submitting the identical incorrect string for the same challenge shared an answer. One of the strongest CTFd-only signals, because a wrong guess is not independently reproducible.",
+                "type": "table",
+                "gridPos": { "h": 10, "w": 24, "x": 0, "y": 24 },
+                "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                "targets": [
+                  {
+                    "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                    "rawSql": "SELECT c.name AS challenge, s.provided AS submitted_flag, COUNT(DISTINCT s.team_id) AS teams, GROUP_CONCAT(DISTINCT t.name ORDER BY t.name SEPARATOR ', ') AS team_names, MIN(s.date) AS first_seen FROM submissions s JOIN teams t ON t.id = s.team_id JOIN challenges c ON c.id = s.challenge_id WHERE s.type = 'incorrect' AND t.hidden = 0 AND t.banned = 0 AND CHAR_LENGTH(s.provided) >= 8 GROUP BY s.challenge_id, c.name, s.provided HAVING teams > 1 ORDER BY teams DESC, first_seen ASC LIMIT 200",
+                    "format": "table",
+                    "rawQuery": true
+                  }
+                ]
+              },
+              {
+                "id": 5,
+                "title": "Submission IP shared across teams",
+                "description": "CTFd records the submitter IP. The same address submitting for several teams suggests one person on multiple accounts. Expect false positives behind a shared NAT, campus network or VPN.",
+                "type": "table",
+                "gridPos": { "h": 10, "w": 24, "x": 0, "y": 34 },
+                "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                "targets": [
+                  {
+                    "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                    "rawSql": "SELECT s.ip AS ip, COUNT(DISTINCT s.team_id) AS teams, GROUP_CONCAT(DISTINCT t.name ORDER BY t.name SEPARATOR ', ') AS team_names, COUNT(*) AS submissions, MIN(s.date) AS first_seen, MAX(s.date) AS last_seen FROM submissions s JOIN teams t ON t.id = s.team_id WHERE s.ip IS NOT NULL AND s.ip <> '' AND t.hidden = 0 AND t.banned = 0 GROUP BY s.ip HAVING teams > 1 ORDER BY teams DESC, submissions DESC LIMIT 200",
+                    "format": "table",
+                    "rawQuery": true
+                  }
+                ]
+              },
+              {
+                "id": 6,
+                "title": "Near-simultaneous solves (same challenge, within 3 min)",
+                "description": "Team pairs solving the same challenge close together. Clusters legitimately at challenge release, so read it alongside the first-blood times on the Scoreboard dashboard.",
+                "type": "table",
+                "gridPos": { "h": 10, "w": 24, "x": 0, "y": 44 },
+                "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                "targets": [
+                  {
+                    "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                    "rawSql": "SELECT c.name AS challenge, ta.name AS team_a, tb.name AS team_b, a.date AS first_solved_at, ABS(TIMESTAMPDIFF(SECOND, a.date, b.date)) AS seconds_apart FROM submissions a JOIN submissions b ON b.challenge_id = a.challenge_id AND b.type = 'correct' AND b.team_id > a.team_id AND ABS(TIMESTAMPDIFF(SECOND, a.date, b.date)) <= 180 JOIN challenges c ON c.id = a.challenge_id JOIN teams ta ON ta.id = a.team_id JOIN teams tb ON tb.id = b.team_id WHERE a.type = 'correct' AND ta.hidden = 0 AND ta.banned = 0 AND tb.hidden = 0 AND tb.banned = 0 ORDER BY seconds_apart ASC LIMIT 200",
+                    "format": "table",
+                    "rawQuery": true
+                  }
+                ]
+              },
+              {
+                "id": 7,
+                "title": "Flag brute-forcing",
+                "description": "Teams with a high rate of incorrect submissions on one challenge — scripted guessing rather than solving. Only rows with at least 20 wrong attempts are shown.",
+                "type": "table",
+                "gridPos": { "h": 10, "w": 24, "x": 0, "y": 54 },
+                "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                "targets": [
+                  {
+                    "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
+                    "rawSql": "SELECT t.name AS team, c.name AS challenge, COUNT(*) AS incorrect, TIMESTAMPDIFF(SECOND, MIN(s.date), MAX(s.date)) AS window_seconds, ROUND(COUNT(*) * 60.0 / GREATEST(TIMESTAMPDIFF(SECOND, MIN(s.date), MAX(s.date)), 1), 1) AS per_minute FROM submissions s JOIN teams t ON t.id = s.team_id JOIN challenges c ON c.id = s.challenge_id WHERE s.type = 'incorrect' AND t.hidden = 0 AND t.banned = 0 GROUP BY t.id, t.name, c.id, c.name HAVING incorrect >= 20 ORDER BY per_minute DESC LIMIT 100",
+                    "format": "table",
+                    "rawQuery": true
+                  }
+                ]
+              }
+            ]
+          }
+        dest: "{{ ctfd_path }}/grafana/provisioning/dashboards/integrity.json"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    - name: Write NervCTF provisioning-health dashboard
+      copy:
+        content: |
+          {
+            "title": "NervCTF Provisioning Health",
+            "uid": "nervctf-provisioning-health",
+            "schemaVersion": 39,
+            "editable": true,
+            "time": { "from": "now-6h", "to": "now" },
+            "refresh": "30s",
+            "panels": [
+              {
+                "id": 1,
+                "title": "Provisioning Rate by Outcome",
+                "type": "timeseries",
+                "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "targets": [
+                  {
+                    "datasource": { "type": "prometheus", "uid": "prometheus" },
+                    "expr": "rate(nervctf_provision_total[5m])",
+                    "legendFormat": "{{ '{{result}}' }}"
+                  }
+                ]
+              },
+              {
+                "id": 2,
+                "title": "Active Instances",
+                "type": "timeseries",
+                "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "targets": [
+                  {
+                    "datasource": { "type": "prometheus", "uid": "prometheus" },
+                    "expr": "nervctf_active_instances",
+                    "legendFormat": "{{ '{{status}}' }}"
+                  }
+                ]
+              },
+              {
+                "id": 3,
+                "title": "Provisioning Queue Saturation",
+                "type": "timeseries",
+                "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "targets": [
+                  {
+                    "datasource": { "type": "prometheus", "uid": "prometheus" },
+                    "expr": "nervctf_provision_queue_available",
+                    "legendFormat": "available"
+                  },
+                  {
+                    "datasource": { "type": "prometheus", "uid": "prometheus" },
+                    "expr": "nervctf_provision_queue_capacity",
+                    "legendFormat": "capacity"
+                  }
+                ]
+              }
+            ]
+          }
+        dest: "{{ ctfd_path }}/grafana/provisioning/dashboards/provisioning-health.json"
         owner: "{{ docker_user }}"
         group: docker
         mode: "0644"
@@ -504,6 +894,62 @@
             | default('mysql://ctfd:ctfd@db/ctfd')
             | regex_replace('\+pymysql', '')
           }}
+
+    # Decompose ctfd_db_url (mysql://user:pass@host[:port]/db) into discrete fields —
+    # Grafana's MySQL datasource wants separate host/port/database/user/password, not
+    # a single connection URL. Placed here (not alongside the other datasource-writing
+    # tasks above) because this is the earliest point ctfd_db_url is known in this
+    # playbook's task order.
+    - name: Decompose CTFD_DB_URL for Grafana's MySQL datasource
+      set_fact:
+        ctfd_db_user: "{{ ctfd_db_url | regex_replace('^mysql://([^:]+):.*$', '\\1') }}"
+        ctfd_db_pass: "{{ ctfd_db_url | regex_replace('^mysql://[^:]+:([^@]+)@.*$', '\\1') }}"
+        ctfd_db_host_raw: "{{ ctfd_db_url | regex_replace('^mysql://[^@]+@([^/]+)/.*$', '\\1') }}"
+        ctfd_db_name: "{{ ctfd_db_url | regex_replace('^mysql://[^/]+/([^?]*).*$', '\\1') }}"
+
+    - name: Append default MySQL port if CTFD_DB_URL host had none
+      set_fact:
+        ctfd_db_host: "{{ ctfd_db_host_raw if ':' in ctfd_db_host_raw else ctfd_db_host_raw + ':3306' }}"
+
+    # Reuses remote-monitor's own CTFd DB credentials (full read-write) rather than a
+    # scoped read-only grant — see the matching comment in nervctf_playbook.yml for why.
+    - name: Write Grafana MySQL datasource (CTFd's MariaDB, for scoreboard dashboards)
+      copy:
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: CTFd
+              uid: ctfd-mysql
+              type: mysql
+              access: proxy
+              url: "{{ ctfd_db_host }}"
+              database: "{{ ctfd_db_name }}"
+              user: "{{ ctfd_db_user }}"
+              secureJsonData:
+                password: "{{ ctfd_db_pass }}"
+        dest: "{{ ctfd_path }}/grafana/provisioning/datasources/mysql.yml"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0640"
+
+    - name: Write Grafana Infinity datasource (remote-monitor's admin JSON API)
+      copy:
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: NervCTF Admin API
+              uid: nervctf-infinity
+              type: yesoreyeram-infinity-datasource
+              access: proxy
+              url: "http://remote-monitor:{{ monitor_port }}"
+              jsonData:
+                httpHeaderName1: "Authorization"
+              secureJsonData:
+                httpHeaderValue1: "Token {{ monitor_token }}"
+        dest: "{{ ctfd_path }}/grafana/provisioning/datasources/infinity.yml"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0640"
 
     - name: Resolve runner hostname to IP on CTFd host
       when: runner_ip is defined
@@ -597,6 +1043,7 @@
                 # SSH tunnel task below for why this is correct in split-machine
                 # mode too.
                 - LOKI_URL=http://127.0.0.1:3100/loki/api/v1/push
+                - CAPTURE_BASE_DIR=/var/lib/nervctf-captures
                 - MAX_CONCURRENT_PROVISIONS={{ max_concurrent_provisions }}
                 - MAX_INSTANCES_PER_TEAM={{ max_instances_per_team }}
           {% if ctfd_domain is defined and ctfd_domain %}
@@ -612,6 +1059,7 @@
                 - /var/run/docker.sock:/var/run/docker.sock
                 - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
                 - /tmp/ctf-flags:/tmp/ctf-flags
+                - /var/lib/nervctf-captures:/var/lib/nervctf-captures:ro
           {% endif %}
                 - {{ ctfd_path }}/remote-monitor/data:{{ ctfd_path }}/remote-monitor/data
                 - {{ ctfd_path }}/.data/CTFd/uploads:{{ ctfd_path }}/.data/CTFd/uploads
@@ -675,6 +1123,7 @@
                 - GF_SECURITY_ADMIN_USER=admin
                 - GF_SECURITY_ADMIN_PASSWORD={{ monitor_token }}
                 - GF_AUTH_ANONYMOUS_ENABLED=false
+                - GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource
               volumes:
                 - {{ ctfd_path }}/grafana/data:/var/lib/grafana
                 - {{ ctfd_path }}/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -764,6 +1213,45 @@
       command: docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions
       register: loki_plugin_install_runner
       failed_when: loki_plugin_install_runner.rc != 0 and 'already exist' not in loki_plugin_install_runner.stderr
+
+    # ── nervctf-tap image (runner side) ───────────────────────────────────────
+    # Split-machine mode runs the tap sidecar on THIS host, so the image must exist
+    # here. nervctf-proxy was only ever built on the primary host — a split-machine
+    # deployment that opted into log_proxy would have failed with "image not found".
+    - name: Ensure nervctf-tap directory exists on runner
+      file:
+        path: /opt/nervctf/tap
+        state: directory
+        mode: "0755"
+      when: runner_ip is defined and tap_binary is defined
+
+    - name: Copy nervctf-tap binary to runner
+      copy:
+        src: "{{ tap_binary }}"
+        dest: /opt/nervctf/tap/nervctf-tap
+        mode: "0755"
+      when: runner_ip is defined and tap_binary is defined
+
+    - name: Write nervctf-tap Dockerfile on runner
+      copy:
+        content: |
+          FROM debian:bookworm-slim
+          COPY nervctf-tap /usr/local/bin/nervctf-tap
+          ENTRYPOINT ["/usr/local/bin/nervctf-tap"]
+        dest: /opt/nervctf/tap/Dockerfile
+        mode: "0644"
+      when: runner_ip is defined and tap_binary is defined
+
+    - name: Rebuild nervctf-tap Docker image on runner
+      command: docker build -t nervctf-tap:latest /opt/nervctf/tap
+      when: runner_ip is defined and tap_binary is defined
+
+    - name: Ensure nervctf capture directory exists on runner
+      file:
+        path: /var/lib/nervctf-captures
+        state: directory
+        mode: "0777"
+      when: runner_ip is defined
 
 # ── Reverse SSH tunnel: primary → runner (split-machine mode only) ────────────
 # See the primary playbook for the full rationale. Re-applied on every upgrade

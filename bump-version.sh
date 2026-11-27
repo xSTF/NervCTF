@@ -9,6 +9,7 @@ usage() {
     echo "  Cargo.toml (workspace)"
     echo "  src/nervctf/Cargo.toml"
     echo "  src/remote-monitor/Cargo.toml"
+    echo "  src/nervctf-tap/Cargo.toml"
     echo "  flake.nix (both derivations)"
     echo "  src/nervctf/src/main.rs (--version string)"
     exit 1
@@ -40,6 +41,7 @@ echo "$CURRENT -> $NEW"
 sed -i 's|^version = ".*"|version = "'"$NEW"'"|' Cargo.toml
 sed -i 's|^version = ".*"|version = "'"$NEW"'"|' src/nervctf/Cargo.toml
 sed -i 's|^version = ".*"|version = "'"$NEW"'"|' src/remote-monitor/Cargo.toml
+sed -i 's|^version = ".*"|version = "'"$NEW"'"|' src/nervctf-tap/Cargo.toml
 
 # flake.nix: `version = "X.Y.Z";`  (semicolon distinguishes it from Cargo/TOML syntax)
 sed -i 's|version = "[0-9]\+\.[0-9]\+\.[0-9]\+";|version = "'"$NEW"'";|g' flake.nix

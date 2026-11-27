@@ -3,6 +3,7 @@ members = [
     "src/nervctf",
     "src/remote-monitor",
     "src/nervctf-proxy",
+    "src/nervctf-tap",
 ]
 resolver = "2"
 

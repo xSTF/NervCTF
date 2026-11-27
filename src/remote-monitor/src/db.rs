@@ -409,6 +409,17 @@ pub fn count_active_instances_for_team(db: &Db, team_id: i64) -> Result<i64> {
     Ok(n)
 }
 
+/// Count active (running + provisioning) instances globally, grouped by status —
+/// used by the `/metrics` endpoint's `nervctf_active_instances` gauge.
+pub fn count_instances_by_status(db: &Db) -> Result<Vec<(String, i64)>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let mut stmt = conn.prepare(
+        "SELECT status, COUNT(*) FROM instances WHERE status IN ('running', 'provisioning') GROUP BY status",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
 /// Insert a placeholder row with status='provisioning' so the info endpoint can
 /// return status immediately while compose runs in the background.
 /// Uses INSERT OR IGNORE so a concurrent retry doesn't clobber an existing row.
@@ -811,6 +822,70 @@ pub fn list_flag_attempts(db: &Db, limit: i64) -> Result<Vec<Value>> {
             "owner_team_id": row.get::<_, Option<i64>>(9)?,
             "owner_team_name": row.get::<_, Option<String>>(10)?,
             "timestamp": row.get::<_, String>(11)?,
+        }))
+    })?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
+/// Integrity findings derived purely from the monitor's own bookkeeping — no traffic
+/// capture needed, so this works for every backend and every challenge type.
+///
+/// Two signals, both built on the fact that a team cannot legitimately solve an
+/// *instance* challenge without ever having been given an instance of it:
+///
+///   * `solved_without_instance` — the team has a correct solve for an instance
+///     challenge but never requested an instance. There is nothing to have solved.
+///   * `solved_before_request` — the team solved it before their first request. The
+///     flag reached them from somewhere other than their own instance.
+///
+/// `instance.requested` events are used rather than the `instances` table because
+/// instance rows are deleted on teardown, while the event log is durable.
+///
+/// Team-mode only: in CTFd user-mode `ctfd_solves.team_id` carries the user id, so the
+/// `ctfd_teams` join yields no name (the finding still lists, with a null team_name).
+///
+/// False positives to expect: a challenge converted from standard to instance
+/// mid-event, and solves imported or awarded by an admin. Both are worth a look anyway.
+pub fn list_integrity_findings(db: &Db) -> Result<Vec<Value>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let mut stmt = conn.prepare(
+        "SELECT 'solved_without_instance' AS signal,
+                cs.challenge_name, cs.team_id, ct.name, cs.solved_at,
+                'no instance.requested event for this team' AS detail
+         FROM ctfd_solves cs
+         LEFT JOIN ctfd_teams ct ON ct.id = cs.team_id
+         WHERE EXISTS (SELECT 1 FROM instance_configs ic
+                       WHERE ic.challenge_name = cs.challenge_name)
+           AND NOT EXISTS (SELECT 1 FROM events e
+                           WHERE e.event_type = 'instance.requested'
+                             AND e.challenge_name = cs.challenge_name
+                             AND e.team_id = cs.team_id)
+         UNION ALL
+         SELECT 'solved_before_request' AS signal,
+                cs.challenge_name, cs.team_id, ct.name, cs.solved_at,
+                'first instance request at ' || MIN(e.created_at) AS detail
+         FROM ctfd_solves cs
+         JOIN events e ON e.event_type = 'instance.requested'
+                      AND e.challenge_name = cs.challenge_name
+                      AND e.team_id = cs.team_id
+         LEFT JOIN ctfd_teams ct ON ct.id = cs.team_id
+         WHERE cs.solved_at IS NOT NULL
+         GROUP BY cs.challenge_name, cs.team_id, ct.name, cs.solved_at
+         HAVING MIN(e.created_at) > cs.solved_at
+         ORDER BY 5 DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "signal": row.get::<_, String>(0)?,
+            "challenge_name": row.get::<_, String>(1)?,
+            "team_id": row.get::<_, i64>(2)?,
+            "team_name": row.get::<_, Option<String>>(3)?,
+            "solved_at": row.get::<_, Option<String>>(4)?,
+            "detail": row.get::<_, Option<String>>(5)?,
         }))
     })?;
     let mut result = Vec::new();
@@ -1255,5 +1330,167 @@ pub fn load_probe_result(db: &Db) -> Result<Option<crate::ctfd_db::ProbeResult>>
         Ok(r) => Ok(Some(r)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+
+    /// Real schema, in-memory. `open()` takes a path, and `:memory:` gives a private
+    /// database per connection, so the full `init_schema` runs against the same DDL
+    /// production uses — a column rename would fail these tests, not just drift.
+    fn test_db() -> Db {
+        open(":memory:").expect("open in-memory db")
+    }
+
+    fn exec(db: &Db, sql: &str) {
+        db.lock().unwrap().execute_batch(sql).expect(sql);
+    }
+
+    /// An instance challenge, a team, and a correct solve for it.
+    fn seed(db: &Db) {
+        exec(
+            db,
+            "INSERT INTO instance_configs (challenge_name, ctfd_id, backend, config_json)
+               VALUES ('web-chal', 1, 'docker', '{}');
+             INSERT INTO ctfd_teams (id, name) VALUES (7, 'Team Seven'), (8, 'Team Eight');",
+        );
+    }
+
+    fn signals(db: &Db) -> Vec<(String, i64)> {
+        list_integrity_findings(db)
+            .expect("query runs")
+            .into_iter()
+            .map(|v| {
+                (
+                    v["signal"].as_str().unwrap().to_string(),
+                    v["team_id"].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn solve_with_a_prior_instance_request_is_not_flagged() {
+        let db = test_db();
+        seed(&db);
+        exec(
+            &db,
+            "INSERT INTO events (event_type, challenge_name, team_id, created_at)
+               VALUES ('instance.requested', 'web-chal', 7, '2026-01-01 10:00:00');
+             INSERT INTO ctfd_solves (challenge_name, team_id, solved_at)
+               VALUES ('web-chal', 7, '2026-01-01 10:05:00');",
+        );
+        assert_eq!(signals(&db), Vec::<(String, i64)>::new());
+    }
+
+    #[test]
+    fn solve_without_any_instance_request_is_flagged() {
+        let db = test_db();
+        seed(&db);
+        exec(
+            &db,
+            "INSERT INTO ctfd_solves (challenge_name, team_id, solved_at)
+               VALUES ('web-chal', 8, '2026-01-01 10:05:00');",
+        );
+        assert_eq!(
+            signals(&db),
+            vec![("solved_without_instance".to_string(), 8)]
+        );
+    }
+
+    #[test]
+    fn solve_before_the_first_request_is_flagged() {
+        let db = test_db();
+        seed(&db);
+        exec(
+            &db,
+            "INSERT INTO events (event_type, challenge_name, team_id, created_at)
+               VALUES ('instance.requested', 'web-chal', 7, '2026-01-01 11:00:00');
+             INSERT INTO ctfd_solves (challenge_name, team_id, solved_at)
+               VALUES ('web-chal', 7, '2026-01-01 10:00:00');",
+        );
+        assert_eq!(signals(&db), vec![("solved_before_request".to_string(), 7)]);
+    }
+
+    #[test]
+    fn only_the_earliest_request_counts() {
+        // A later re-request must not make an earlier legitimate solve look suspicious.
+        let db = test_db();
+        seed(&db);
+        exec(
+            &db,
+            "INSERT INTO events (event_type, challenge_name, team_id, created_at) VALUES
+               ('instance.requested', 'web-chal', 7, '2026-01-01 09:00:00'),
+               ('instance.requested', 'web-chal', 7, '2026-01-01 12:00:00');
+             INSERT INTO ctfd_solves (challenge_name, team_id, solved_at)
+               VALUES ('web-chal', 7, '2026-01-01 10:00:00');",
+        );
+        assert_eq!(signals(&db), Vec::<(String, i64)>::new());
+    }
+
+    #[test]
+    fn non_instance_challenges_are_ignored() {
+        // A standard (non-instance) challenge has no instance to provision, so a solve
+        // with no request is normal and must not be reported.
+        let db = test_db();
+        exec(
+            &db,
+            "INSERT INTO ctfd_teams (id, name) VALUES (7, 'Team Seven');
+             INSERT INTO ctfd_solves (challenge_name, team_id, solved_at)
+               VALUES ('static-chal', 7, '2026-01-01 10:00:00');",
+        );
+        assert_eq!(signals(&db), Vec::<(String, i64)>::new());
+    }
+
+    #[test]
+    fn a_requests_event_for_another_team_does_not_clear_this_team() {
+        let db = test_db();
+        seed(&db);
+        exec(
+            &db,
+            "INSERT INTO events (event_type, challenge_name, team_id, created_at)
+               VALUES ('instance.requested', 'web-chal', 7, '2026-01-01 09:00:00');
+             INSERT INTO ctfd_solves (challenge_name, team_id, solved_at)
+               VALUES ('web-chal', 8, '2026-01-01 10:00:00');",
+        );
+        assert_eq!(
+            signals(&db),
+            vec![("solved_without_instance".to_string(), 8)]
+        );
+    }
+
+    #[test]
+    fn a_different_event_type_does_not_count_as_a_request() {
+        let db = test_db();
+        seed(&db);
+        exec(
+            &db,
+            "INSERT INTO events (event_type, challenge_name, team_id, created_at)
+               VALUES ('instance.stopped', 'web-chal', 8, '2026-01-01 09:00:00');
+             INSERT INTO ctfd_solves (challenge_name, team_id, solved_at)
+               VALUES ('web-chal', 8, '2026-01-01 10:00:00');",
+        );
+        assert_eq!(
+            signals(&db),
+            vec![("solved_without_instance".to_string(), 8)]
+        );
+    }
+
+    #[test]
+    fn team_name_is_resolved_and_findings_carry_detail() {
+        let db = test_db();
+        seed(&db);
+        exec(
+            &db,
+            "INSERT INTO ctfd_solves (challenge_name, team_id, solved_at)
+               VALUES ('web-chal', 8, '2026-01-01 10:05:00');",
+        );
+        let f = &list_integrity_findings(&db).unwrap()[0];
+        assert_eq!(f["team_name"], "Team Eight");
+        assert_eq!(f["challenge_name"], "web-chal");
+        assert_eq!(f["solved_at"], "2026-01-01 10:05:00");
+        assert!(f["detail"].as_str().unwrap().contains("no instance.requested"));
     }
 }

@@ -65,18 +65,27 @@ In split-machine mode, Docker commands run on a separate worker node over SSH (`
 | `MAX_INSTANCES_PER_TEAM` | `0` | Max active instances per team (0 = unlimited) |
 | `CTFD_DB_SYNC_INTERVAL` | `30` | Seconds between CTFd-to-SQLite sync cycles |
 | `CTFD_DOMAIN` | `""` | CTFd base URL shown in dashboard links (for example `http://ctfd.example.com`); defaults to `http://{PUBLIC_HOST}`. The playbook sets it from `ctfd_domain` in `.nervctf.yml`. |
-| `LOKI_URL` | `http://127.0.0.1:3100/loki/api/v1/push` | Push endpoint passed to the `log_proxy` sidecar's `--log-driver=loki`. Always loopback in both modes — see the Loki section below. |
+| `LOKI_URL` | `http://127.0.0.1:3100/loki/api/v1/push` | Push endpoint for every instance container's `--log-driver=loki` (stdout/stderr only). Always loopback in both modes — see the Loki section below. |
+| `CAPTURE_BASE_DIR` | `/var/lib/nervctf-captures` | Host directory the `nervctf-tap` sidecars write captures into, one subdirectory per instance. Bind-mounted read-only into the monitor in single-machine mode. |
 
 ---
 
-## HTTP traffic logging (`log_proxy`)
+## Traffic capture (`capture: tap`)
 
-A `connection: http` challenge with `log_proxy: true` gets an `nervctf-proxy` sidecar in
-front of it that ships one structured JSON log line per request/response straight to Loki
-(Docker's `loki` logging-driver plugin), tagged with `team_id`/`challenge` labels — see
-[instance challenges](instance-challenges.md#http-traffic-logging-log_proxy) for the opt-in
-scoping and WebSocket/streaming caveats. There is no monitor-side route for this; it's viewed
-directly in Grafana's **NervCTF Player Traffic** dashboard, templated on `$challenge`/`$team_id`.
+An instance whose config resolves to `capture: tap` (explicitly, or via the superseded
+`log_proxy: true`) is fronted by an `nervctf-tap` sidecar: a byte-transparent L4 relay
+that records the raw stream to `CAPTURE_BASE_DIR/<instance>/`. Unlike the `nervctf-proxy`
+it replaces, it interprets no application protocol, so it covers `nc`, raw TCP/UDP, SSH,
+TLS and HTTP alike — see
+[instance challenges](instance-challenges.md#traffic-capture-capture) for the per-challenge
+settings and the one behavioural caveat (the challenge sees the tap's address as the client).
+
+The monitor launches and tears down the sidecar; there is no monitor-side route for reading
+captures yet. On the host, read them with `nervctf-tap dump <file.ntap>`.
+
+Capture bytes are **not** sent to Loki. Loki holds instance container stdout/stderr only,
+viewed in Grafana's **NervCTF Container Logs** dashboard, templated on
+`$challenge`/`$team_id`/`$team_name`.
 
 **Loki itself** is deployed by `nervctf setup`/`setup --upgrade` alongside
 Prometheus/Grafana, always bound `127.0.0.1:3100` on the primary (CTFd) host — never exposed

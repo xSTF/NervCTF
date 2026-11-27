@@ -13,6 +13,60 @@ use serde_json::Value;
 use mysql_async::Pool;
 use crate::db::Db;
 
+/// Strips control characters from a value that will be embedded in generated config,
+/// log labels or capture index records.
+///
+/// `team_name` is **player-controlled** — it is CTFd's `teams.name`, chosen by players
+/// and returned verbatim by `db::get_identity_name` — so it reaches generated compose
+/// YAML and sidecar environment as untrusted input. Quoting is what actually makes the
+/// YAML safe (see `compose::yaml_quote`); this is defence in depth, and keeps newlines
+/// out of capture records regardless of the backend.
+pub fn strip_control(value: &str) -> String {
+    value.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Traffic capture mode for an instance, resolved from its stored `config_json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// In-path `nervctf-tap` sidecar recording the raw byte stream.
+    Tap,
+    /// No capture — published directly, as an instance with no sidecar always was.
+    Off,
+}
+
+/// Resolves the effective capture mode.
+///
+/// `capture` wins when present; otherwise the superseded `log_proxy: true` resolves to
+/// `Tap`, so the many existing `challenge.yml` files that set it keep working and get
+/// the tap instead of the old HTTP proxy.
+///
+/// Two deliberate differences from the `log_proxy` gate this replaces:
+///   * it is **not** conditioned on `connection: http`. The tap interprets nothing, so
+///     an `nc`/`ssh`/raw-TCP challenge is captured just as well.
+///   * `pcap` is accepted by the parser but not implemented, so it resolves to `Off`
+///     here. The CLI validator rejects it up front; this is the defence in depth for a
+///     `config_json` written by a newer CLI than this monitor.
+pub fn capture_mode(config: &Value) -> CaptureMode {
+    match config["capture"].as_str() {
+        Some("tap") => CaptureMode::Tap,
+        Some("off") => CaptureMode::Off,
+        Some(other) => {
+            tracing::warn!(
+                "capture mode '{}' is not supported by this monitor — running with no capture",
+                other
+            );
+            CaptureMode::Off
+        }
+        None => {
+            if config["log_proxy"].as_bool().unwrap_or(false) {
+                CaptureMode::Tap
+            } else {
+                CaptureMode::Off
+            }
+        }
+    }
+}
+
 /// The connection type to show players for the primary port: `"udp"` overrides the
 /// challenge's declared `connection` (nc/http/ssh) whenever the primary port itself is
 /// UDP, since `nc -u` (not plain `nc`) is required to reach it.
@@ -161,25 +215,21 @@ pub async fn provision(
                 }
             }
 
-            // `connection: http` instances with `log_proxy: true` get an HTTP-proxy
-            // sidecar in front of them (see docs/instance-challenges.md) so admins can
-            // review player traffic on demand. Opt-in only — re-terminating HTTP through
-            // our own proxy is a real risk for challenges whose puzzle is HTTP behavior
-            // itself (WebSockets, streaming, raw protocol quirks), so it's off by default.
-            // The app container joins a dedicated per-instance network and is not
-            // published directly; the sidecar is published on `host_port` instead and
-            // forwards to the app by container name.
-            let log_proxy = connection == "http" && config["log_proxy"].as_bool().unwrap_or(false);
-            let proxy_net = log_proxy.then(|| docker::proxy_network_name(&cname));
-            if let Some(net) = &proxy_net {
+            // A captured instance gets an `nervctf-tap` sidecar in front of it (see
+            // docs/instance-challenges.md) so admins can review player traffic. The app
+            // container joins a dedicated per-instance network and is not published
+            // directly; the tap is published on `host_port` instead and forwards to the
+            // app by container name.
+            let tap = capture_mode(config) == CaptureMode::Tap;
+            let tap_net = tap.then(|| docker::instance_network_name(&cname));
+            if let Some(net) = &tap_net {
                 docker::create_network(net, runner_ssh).await?;
             }
 
-            // Only the primary port is proxied; any additional ports (multi-port http
-            // instances, an edge case the schema allows but doesn't exercise today) are
-            // still published directly on the app container, same as non-proxied instances.
+            // Only the primary port is tapped; any additional ports are still published
+            // directly on the app container, same as an uncaptured instance.
             let app_port_mappings: &[(u16, u32, String)] =
-                if log_proxy { &port_mappings[1..] } else { &port_mappings };
+                if tap { &port_mappings[1..] } else { &port_mappings };
 
             // Every instance container (app and, if present, the proxy sidecar) ships its
             // stdout/stderr to Loki with team/challenge labels — not just `log_proxy`-opted-in
@@ -195,31 +245,63 @@ pub async fn provision(
                 command,
                 &env_vars,
                 &volumes,
-                proxy_net.as_deref(),
+                tap_net.as_deref(),
                 &docker::loki_log_args(loki, team_id, team_name.as_deref(), challenge_name),
                 runner_ssh,
             ).await?;
 
-            if log_proxy {
-                let proxy_name = docker::proxy_container_name(&cname);
-                let proxy_env = vec![
-                    ("UPSTREAM".to_string(), format!("http://{}:{}", cname, internal_ports[0].0)),
-                    ("TEAM_ID".to_string(), team_id.to_string()),
-                    ("CHALLENGE_NAME".to_string(), challenge_name.to_string()),
-                    ("LISTEN_PORT".to_string(), "8080".to_string()),
-                ];
-                let proxy_port_mappings = vec![(host_port, 8080u32, "tcp".to_string())];
-                docker::run_container(
-                    "nervctf-proxy:latest",
-                    &proxy_name,
-                    &proxy_port_mappings,
-                    None,
-                    &proxy_env,
-                    &[],
-                    proxy_net.as_deref(),
-                    &docker::loki_log_args(loki, team_id, team_name.as_deref(), challenge_name),
-                    runner_ssh,
-                ).await?;
+            if tap {
+                let tap_name = docker::tap_container_name(&cname);
+                let cap_dir = docker::capture_dir(&cname);
+                // The primary port's protocol decides whether the tap listens TCP or UDP.
+                let (primary_internal, primary_proto) =
+                    (internal_ports[0].0, port_mappings[0].2.clone());
+
+                let tap_env = docker::tap_env(
+                    &cname,
+                    primary_internal,
+                    &primary_proto,
+                    team_id,
+                    team_name.as_deref(),
+                    challenge_name,
+                    &cname,
+                );
+                let tap_port_mappings = vec![(host_port, 8080u32, primary_proto)];
+
+                let mut tap_args =
+                    docker::loki_log_args(loki, team_id, team_name.as_deref(), challenge_name);
+                tap_args.extend(docker::capture_mount_args(&cap_dir));
+
+                // The app container is already up but deliberately unpublished, so if the
+                // tap cannot start the instance is unreachable. Tear the app down and fail
+                // the provision rather than leaving a running instance nobody can connect
+                // to (the old proxy path left exactly that behind).
+                let tap_result = async {
+                    docker::ensure_dir(&cap_dir, runner_ssh).await?;
+                    docker::run_container(
+                        "nervctf-tap:latest",
+                        &tap_name,
+                        &tap_port_mappings,
+                        None,
+                        &tap_env,
+                        &[],
+                        tap_net.as_deref(),
+                        &tap_args,
+                        runner_ssh,
+                    )
+                    .await
+                }
+                .await;
+
+                if let Err(e) = tap_result {
+                    let _ = docker::remove_container(&cname, runner_ssh).await;
+                    return Err(anyhow!(
+                        "tap sidecar for '{}' team {} failed to start ({}); instance torn down.                          Is the nervctf-tap:latest image built on this host?",
+                        challenge_name,
+                        team_id,
+                        e
+                    ));
+                }
             }
 
             let extra_ports = build_extra_ports_json(&port_mappings);
@@ -318,8 +400,14 @@ pub async fn provision(
                     (map, svc_key.to_string(), hp, proto, port_mappings)
                 };
 
-            let log_proxy = connection == "http" && config["log_proxy"].as_bool().unwrap_or(false);
             let team_name = crate::db::get_identity_name(db, team_id, ctfd_mode).unwrap_or(None);
+            // The primary service's first port decides the tap's protocol, matching the
+            // docker backend. `primary_protocol` is already resolved above.
+            let tap_spec = (capture_mode(config) == CaptureMode::Tap).then(|| compose::TapSpec {
+                proto: primary_protocol.clone(),
+                capture_dir: docker::capture_dir(&project_name),
+                instance_id: project_name.clone(),
+            });
             let (_, project) = compose::up(
                 &compose_path,
                 &project_name,
@@ -332,7 +420,7 @@ pub async fn provision(
                 team_id,
                 team_name.as_deref(),
                 challenge_name,
-                log_proxy,
+                tap_spec,
                 loki_url,
                 runner_ssh,
             ).await?;
@@ -484,4 +572,70 @@ fn days_to_ymd(days: u32) -> (u32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod capture_mode_tests {
+    use super::{capture_mode, CaptureMode};
+    use serde_json::json;
+
+    #[test]
+    fn legacy_log_proxy_true_resolves_to_tap() {
+        // The migration contract: existing challenge.yml files that opted into the old
+        // HTTP proxy get the tap, with no edit.
+        assert_eq!(
+            capture_mode(&json!({"log_proxy": true, "connection": "http"})),
+            CaptureMode::Tap
+        );
+    }
+
+    #[test]
+    fn legacy_log_proxy_is_no_longer_gated_on_http() {
+        // The old gate was `connection == "http" && log_proxy`, so an nc challenge that
+        // asked for logging silently got nothing. The tap is protocol-agnostic.
+        for conn in ["nc", "ssh", "udp", "tcp", ""] {
+            assert_eq!(
+                capture_mode(&json!({"log_proxy": true, "connection": conn})),
+                CaptureMode::Tap,
+                "connection: {:?} should still be captured",
+                conn
+            );
+        }
+    }
+
+    #[test]
+    fn neither_field_means_no_capture() {
+        // Default must leave the data path of every instance that never opted in
+        // exactly as it was.
+        assert_eq!(capture_mode(&json!({"connection": "nc"})), CaptureMode::Off);
+        assert_eq!(
+            capture_mode(&json!({"log_proxy": false, "connection": "http"})),
+            CaptureMode::Off
+        );
+        assert_eq!(capture_mode(&json!({})), CaptureMode::Off);
+    }
+
+    #[test]
+    fn explicit_capture_wins_over_log_proxy() {
+        assert_eq!(
+            capture_mode(&json!({"capture": "off", "log_proxy": true})),
+            CaptureMode::Off
+        );
+        assert_eq!(
+            capture_mode(&json!({"capture": "tap", "log_proxy": false})),
+            CaptureMode::Tap
+        );
+    }
+
+    #[test]
+    fn unsupported_mode_degrades_to_off_rather_than_guessing() {
+        // A config_json written by a newer CLI (e.g. `pcap`) must not silently become a
+        // tap — that would put a relay in a path the operator asked to keep clear.
+        assert_eq!(capture_mode(&json!({"capture": "pcap"})), CaptureMode::Off);
+        assert_eq!(capture_mode(&json!({"capture": "wat"})), CaptureMode::Off);
+        assert_eq!(
+            capture_mode(&json!({"capture": "pcap", "log_proxy": true})),
+            CaptureMode::Off
+        );
+    }
 }

@@ -42,6 +42,101 @@ pub async fn compose_cmd() -> tokio::process::Command {
     }
 }
 
+/// What a compose project needs in order to front its primary service with an
+/// `nervctf-tap` sidecar.
+#[derive(Debug, Clone)]
+pub struct TapSpec {
+    /// `"tcp"` or `"udp"` — the primary port's protocol, so the tap listens on the
+    /// right one. A UDP challenge gets a UDP tap.
+    pub proto: String,
+    /// Host directory bind-mounted into the tap at `/cap`. Created before
+    /// `compose up` so Docker does not create it root-owned.
+    pub capture_dir: String,
+    /// Compose project name, recorded in every capture index entry.
+    pub instance_id: String,
+}
+
+/// Serializes a value as a YAML double-quoted scalar.
+///
+/// YAML 1.2 is a superset of JSON and its double-quoted style accepts the same escape
+/// sequences, so a JSON string literal is always a safe, correctly-escaped YAML scalar.
+///
+/// This matters because `team_name` is **player-controlled**: it comes from CTFd's
+/// `teams.name`, which players choose themselves (`db::get_identity_name` returns it
+/// verbatim). Interpolated raw into the override, a team name containing a newline
+/// could inject arbitrary keys into the generated service — `privileged: true`, a
+/// `/:/host` bind mount — and escalate a team rename into host access on the runner.
+/// The Loki label path already passed it through `sanitize_name`; this path must be
+/// just as careful.
+fn yaml_quote(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Renders the `tap:` service for a per-instance compose override.
+///
+/// Pure so the generated YAML is unit-testable without Docker: this block decides
+/// whether a captured compose instance is reachable at all, since the primary
+/// service's own `ports:` entry is suppressed in favour of it.
+///
+/// Every interpolated value is emitted as a quoted scalar, and `environment` uses
+/// compose's mapping form rather than `- KEY=value` list entries, so no value can
+/// terminate its own line. See `yaml_quote`.
+#[allow(clippy::too_many_arguments)]
+fn tap_service_block(
+    spec: &TapSpec,
+    primary_service: &str,
+    primary_internal_port: u32,
+    host_port: u16,
+    team_id: i64,
+    team_name: Option<&str>,
+    challenge_name: &str,
+    loki: &str,
+    loki_labels: &str,
+) -> String {
+    // Compose needs the published port tagged `/udp` for a UDP challenge, or the
+    // datagrams never reach the tap.
+    let port_spec = if spec.proto == "udp" {
+        format!("{}:8080/udp", host_port)
+    } else {
+        format!("{}:8080", host_port)
+    };
+    let mut out = String::from("  tap:\n");
+    out.push_str("    image: nervctf-tap:latest\n");
+    out.push_str("    restart: unless-stopped\n");
+    out.push_str("    ports:\n");
+    out.push_str(&format!("      - {}\n", yaml_quote(&port_spec)));
+    out.push_str("    environment:\n");
+    for (key, value) in [
+        (
+            "UPSTREAM",
+            format!("{}:{}", primary_service, primary_internal_port),
+        ),
+        ("PROTO", spec.proto.clone()),
+        ("LISTEN_PORT", "8080".to_string()),
+        ("TEAM_ID", team_id.to_string()),
+        ("TEAM_NAME", super::strip_control(team_name.unwrap_or(""))),
+        ("CHALLENGE_NAME", super::strip_control(challenge_name)),
+        ("INSTANCE_ID", super::strip_control(&spec.instance_id)),
+        ("CAPTURE_DIR", "/cap".to_string()),
+    ] {
+        out.push_str(&format!("      {}: {}\n", key, yaml_quote(&value)));
+    }
+    out.push_str("    volumes:\n");
+    out.push_str(&format!(
+        "      - {}\n",
+        yaml_quote(&format!("{}:/cap", spec.capture_dir))
+    ));
+    out.push_str("    logging:\n");
+    out.push_str("      driver: loki\n");
+    out.push_str("      options:\n");
+    out.push_str(&format!("        loki-url: {}\n", yaml_quote(loki)));
+    out.push_str(&format!(
+        "        loki-external-labels: {}\n",
+        yaml_quote(loki_labels)
+    ));
+    out
+}
+
 /// Bring up a compose project for a team instance.
 ///
 /// `compose_file`     — path to the docker-compose.yml (on runner in split mode, local otherwise)
@@ -55,21 +150,19 @@ pub async fn compose_cmd() -> tokio::process::Command {
 ///                      file at `flag_file_path` inside `flag_service`
 /// `flag_file_path`   — absolute path inside the container (required for `"file"` mode)
 /// `flag_service`     — service that receives the flag file mount; defaults to `primary_service`
-/// `team_id`/`challenge_name` — passed to the proxy sidecar's env (`TEAM_ID`/`CHALLENGE_NAME`)
-///                      when `http_proxy` is true; also attached as Loki labels on every
+/// `team_id`/`challenge_name` — passed to the tap sidecar's env (`TEAM_ID`/`CHALLENGE_NAME`)
+///                      when `tap` is set; also attached as Loki labels on every
 ///                      service (see `loki_url`), unused for env otherwise.
 /// `team_name`        — team's display name if known (looked up from CTFd's `teams`
 ///                      table); attached as an extra `team_name` Loki label alongside
 ///                      `team_id` so Grafana can show/filter by name instead of ID.
-/// `http_proxy`       — when true (challenge opted in via `log_proxy: true` and
-///                      `connection: http`), the primary service is *not* published
-///                      directly; instead an `nervctf-proxy` sidecar is published on its
-///                      host port and forwards to the primary service by compose
-///                      service-name DNS, shipping each request/response to Loki for
-///                      the "NervCTF Player Traffic" Grafana dashboard
-///                      (see `docs/instance-challenges.md`).
-/// `loki_url`         — Loki push endpoint for the proxy sidecar's `--log-driver=loki`;
-///                      required when `http_proxy` is true, unused otherwise.
+/// `tap`              — when set (challenge resolved to `capture: tap`), the primary
+///                      service is *not* published directly; instead an `nervctf-tap`
+///                      sidecar is published on its host port and relays bytes to the
+///                      primary service by compose service-name DNS (the same mechanism
+///                      `compose_service` already relies on), recording the raw stream
+///                      under `capture_dir` (see `docs/instance-challenges.md`).
+/// `loki_url`         — Loki push endpoint for every service's `--log-driver=loki`.
 /// `runner_ssh`       — override SSH target; falls back to `runner_target()` if `None`
 ///
 /// Returns `(primary_host_port, container_id_or_project)`.
@@ -85,7 +178,7 @@ pub async fn up(
     team_id: i64,
     team_name: Option<&str>,
     challenge_name: &str,
-    http_proxy: bool,
+    tap: Option<TapSpec>,
     loki_url: Option<&str>,
     runner_ssh: Option<&str>,
 ) -> Result<(u16, String)> {
@@ -187,9 +280,10 @@ pub async fn up(
     //   1. Main service (svc_name): image + ports + optional flag volume.
     //   2. All other pre-built services: image + optional flag volume.
     //   3. Flag-service stub if it differs from the main service and wasn't pre-built.
-    // Every service ships stdout/stderr to Loki with team/challenge labels, not just the
-    // `log_proxy`-opted-in HTTP sidecar, so raw logs for any challenge (nc, ssh, …) show
-    // up on the "NervCTF Player Traffic" Grafana dashboard filtered by challenge/team.
+    // Every service ships stdout/stderr to Loki with team/challenge labels, so raw logs
+    // for any challenge (nc, ssh, …) show up in Grafana filtered by challenge/team. That
+    // is container *stdout* only — the request/response bytes come from the tap's capture
+    // files, not from here.
     let mut override_content = String::from("services:\n");
 
     // Helper closure — add image + optional ports/volumes for one service.
@@ -230,10 +324,10 @@ pub async fn up(
         }};
     }
 
-    // Main service first so any appended lines land in the right block. When an
-    // HTTP-proxy sidecar fronts this instance, the primary service is not published
-    // directly — only the sidecar (added below) is.
-    add_service!(svc_name, http_proxy);
+    // Main service first so any appended lines land in the right block. When a tap
+    // sidecar fronts this instance, the primary service is not published directly —
+    // only the sidecar (added below) is.
+    add_service!(svc_name, tap.is_some());
 
     // All other pre-built services.
     for svc in &pre_built_services {
@@ -255,18 +349,27 @@ pub async fn up(
         }
     }
 
-    // HTTP-proxy sidecar: published on the primary service's host port, forwarding to
-    // the primary service by compose's built-in service-name DNS (the same mechanism
+    // Tap sidecar: published on the primary service's host port, relaying to the
+    // primary service by compose's built-in service-name DNS (the same mechanism
     // `compose_service` already relies on for inter-service traffic).
-    if http_proxy {
+    if let Some(ref spec) = tap {
         let primary_internal_port = service_mappings
             .get(svc_name)
             .and_then(|v| v.first())
             .map(|(_, ip, _)| *ip)
             .unwrap_or(80);
-        override_content.push_str(&format!(
-            "  proxy:\n    image: nervctf-proxy:latest\n    restart: unless-stopped\n    ports:\n      - \"{}:8080\"\n    environment:\n      - UPSTREAM=http://{}:{}\n      - TEAM_ID={}\n      - CHALLENGE_NAME={}\n      - LISTEN_PORT=8080\n    logging:\n      driver: loki\n      options:\n        loki-url: \"{}\"\n        loki-external-labels: \"{}\"\n",
-            host_port, svc_name, primary_internal_port, team_id, challenge_name, loki, loki_labels,
+        // Created before `compose up` so the bind mount is not auto-created root-owned.
+        super::docker::ensure_dir(&spec.capture_dir, effective_target.as_deref()).await?;
+        override_content.push_str(&tap_service_block(
+            spec,
+            svc_name,
+            primary_internal_port,
+            host_port,
+            team_id,
+            team_name,
+            challenge_name,
+            loki,
+            &loki_labels,
         ));
     }
 
@@ -511,4 +614,327 @@ pub async fn build(compose_file: &str, runner_ssh: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(proto: &str) -> TapSpec {
+        TapSpec {
+            proto: proto.to_string(),
+            capture_dir: "/var/lib/nervctf-captures/proj-t7".to_string(),
+            instance_id: "proj-t7".to_string(),
+        }
+    }
+
+    fn block(proto: &str) -> String {
+        tap_service_block(
+            &spec(proto),
+            "web",
+            8000,
+            31337,
+            7,
+            Some("team_seven"),
+            "my-chal",
+            "http://127.0.0.1:3100/loki/api/v1/push",
+            "team_id=7,challenge=my-chal,team_name=team_seven",
+        )
+    }
+
+    #[test]
+    fn tcp_tap_block_publishes_the_primary_host_port() {
+        let b = block("tcp");
+        assert!(b.contains("  tap:\n"), "{}", b);
+        assert!(b.contains("image: nervctf-tap:latest"), "{}", b);
+        assert!(b.contains("- \"31337:8080\""), "{}", b);
+        // Relays to the primary service by compose service-name DNS, no scheme.
+        assert!(b.contains("UPSTREAM: \"web:8000\""), "{}", b);
+        assert!(b.contains("PROTO: \"tcp\""), "{}", b);
+        assert!(b.contains("INSTANCE_ID: \"proj-t7\""), "{}", b);
+        assert!(b.contains("TEAM_NAME: \"team_seven\""), "{}", b);
+        assert!(
+            b.contains("- \"/var/lib/nervctf-captures/proj-t7:/cap\""),
+            "capture mount must be read-write: {}",
+            b
+        );
+    }
+
+    #[test]
+    fn udp_tap_block_tags_the_published_port() {
+        let b = block("udp");
+        // Without /udp compose publishes TCP and the datagrams never arrive.
+        assert!(b.contains("- \"31337:8080/udp\""), "{}", b);
+        assert!(b.contains("PROTO: \"udp\""), "{}", b);
+    }
+
+    #[test]
+    fn player_controlled_team_name_cannot_inject_yaml() {
+        // CTFd lets players choose their own team name, and it reaches here verbatim.
+        // A newline would otherwise let a team rename add service keys to the override.
+        let evil = "pwn\n      privileged: true\n      volumes:\n        - /:/host\n";
+        let b = tap_service_block(
+            &spec("tcp"), "web", 8000, 31337, 7, Some(evil), "chal",
+            "http://loki/push", "team_id=7",
+        );
+        // The payload may appear *inside* a quoted scalar — that is harmless. What
+        // must not happen is it becoming YAML structure of its own, so assert on keys
+        // and list entries rather than on the substring.
+        for line in b.lines().filter(|l| !l.trim().is_empty()) {
+            let t = line.trim_start();
+            assert!(
+                !t.starts_with("privileged"),
+                "injected key became YAML structure: {:?}\n{}",
+                line,
+                b
+            );
+            assert!(
+                !t.starts_with("- /:/host"),
+                "injected list entry became YAML structure: {:?}\n{}",
+                line,
+                b
+            );
+            // Every line must still belong to the tap service block.
+            assert!(
+                line.starts_with("  "),
+                "line escaped the service block: {:?}",
+                line
+            );
+        }
+        // Exactly the keys this block is supposed to declare, no more.
+        let keys: Vec<&str> = b
+            .lines()
+            .filter(|l| l.starts_with("    ") && !l.starts_with("     "))
+            .map(|l| l.trim())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "image: nervctf-tap:latest",
+                "restart: unless-stopped",
+                "ports:",
+                "environment:",
+                "volumes:",
+                "logging:",
+            ],
+            "unexpected service keys:\n{}",
+            b
+        );
+        // The name survives as a single-line scalar, control chars removed.
+        assert!(
+            b.contains("TEAM_NAME: \"pwn      privileged: true      volumes:        - /:/host\""),
+            "unexpected TEAM_NAME rendering:\n{}",
+            b
+        );
+    }
+
+    #[test]
+    fn quotes_and_backslashes_in_a_team_name_are_escaped() {
+        let evil = r#"a" + b\ "c"#;
+        let b = tap_service_block(
+            &spec("tcp"), "web", 8000, 31337, 7, Some(evil), "chal",
+            "http://loki/push", "team_id=7",
+        );
+        // serde_json escaping keeps the scalar closed; the value round-trips as JSON,
+        // which is exactly what a YAML double-quoted scalar accepts.
+        let line = b
+            .lines()
+            .find(|l| l.trim_start().starts_with("TEAM_NAME:"))
+            .expect("TEAM_NAME line");
+        let rendered = line.trim_start().trim_start_matches("TEAM_NAME: ");
+        let parsed: String = serde_json::from_str(rendered).expect("valid quoted scalar");
+        assert_eq!(parsed, evil);
+    }
+
+    #[test]
+    fn capture_dir_is_quoted_too() {
+        // Derived from a sanitized project name today, but it is interpolated into a
+        // volume entry, so it must not depend on that for safety.
+        let s = TapSpec {
+            proto: "tcp".to_string(),
+            capture_dir: "/caps/a b\n      privileged: true".to_string(),
+            instance_id: "p".to_string(),
+        };
+        let b = tap_service_block(
+            &s, "web", 80, 1, 1, None, "c", "http://loki/push", "l",
+        );
+        assert!(!b.contains("privileged: true\n"), "{}", b);
+        for line in b.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(line.starts_with("  "), "line escaped: {:?}", line);
+        }
+    }
+
+    #[test]
+    fn tap_block_is_valid_yaml_under_a_services_key() {
+        // The block is concatenated into `services:` — indentation errors here break
+        // the whole override, not just the tap.
+        let doc = format!("services:\n{}", block("tcp"));
+        for line in doc.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+            assert!(
+                line.starts_with("  "),
+                "service block line must be indented under `services:`: {:?}",
+                line
+            );
+        }
+        assert_eq!(doc.matches("  tap:").count(), 1);
+    }
+
+    /// Brings a real two-service compose project up from the generated `tap:` block:
+    /// `web` unpublished, the tap published in front of it, reaching `web` by compose
+    /// service-name DNS, and recording to a bind-mounted capture directory.
+    ///
+    /// Ignored by default — needs Docker, `docker compose`, `nervctf-tap:latest` and
+    /// `python:3.12-alpine`. Run with:
+    ///   `cargo test -p remote-monitor -- --ignored --nocapture compose_tap`
+    /// Set `NERVCTF_TEST_CAPTURE_DIR` to a Docker-mountable path.
+    ///
+    /// The `logging: driver: loki` stanza is stripped before `up`, because the Loki
+    /// Docker plugin is installed by the playbook on the deployment hosts and is not
+    /// present in a bare test environment. Everything else — indentation, the published
+    /// port spec, env, the upstream service DNS name and the capture mount — is exactly
+    /// what `up()` writes.
+    #[tokio::test]
+    #[ignore = "requires Docker + docker compose + nervctf-tap:latest"]
+    async fn compose_tap_block_brings_up_a_working_instance() {
+        use std::collections::HashSet;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let base_dir = std::env::var("NERVCTF_TEST_CAPTURE_DIR").unwrap_or_else(|_| {
+            std::env::temp_dir()
+                .join("nervctf-tap-it")
+                .display()
+                .to_string()
+        });
+        let proj = format!("nervctf-cit-{}", std::process::id());
+        let work = std::path::Path::new(&base_dir).join(&proj);
+        let cap = work.join("cap");
+        std::fs::create_dir_all(&cap).expect("create capture dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&cap, std::fs::Permissions::from_mode(0o777));
+        }
+
+        let host_port = super::super::docker::pick_free_ports(&HashSet::new(), 1)
+            .expect("pick port")[0];
+
+        // Base compose file: `web` declares no ports, exactly as `up()` leaves the
+        // primary service when a tap fronts it.
+        let base_yml = work.join("docker-compose.yml");
+        std::fs::write(
+            &base_yml,
+            "services:\n  web:\n    image: python:3.12-alpine\n    command: python -m http.server 8000\n",
+        )
+        .expect("write base compose");
+
+        let spec = TapSpec {
+            proto: "tcp".to_string(),
+            capture_dir: cap.display().to_string(),
+            instance_id: proj.clone(),
+        };
+        let block = tap_service_block(
+            &spec, "web", 8000, host_port, 7, Some("team_seven"), "compose-chal",
+            "http://127.0.0.1:3100/loki/api/v1/push", "team_id=7,challenge=compose-chal",
+        );
+        let block = block
+            .split("    logging:\n")
+            .next()
+            .expect("block prefix")
+            .to_string();
+        let override_yml = work.join("override.yml");
+        std::fs::write(&override_yml, format!("services:\n{}", block))
+            .expect("write override");
+
+        let compose = |args: Vec<String>| {
+            let mut c = tokio::process::Command::new("docker");
+            c.arg("compose");
+            c.args(args);
+            c
+        };
+        let up = compose(vec![
+            "-f".into(), base_yml.display().to_string(),
+            "-f".into(), override_yml.display().to_string(),
+            "-p".into(), proj.clone(),
+            "up".into(), "-d".into(),
+        ])
+        .output()
+        .await
+        .expect("compose up");
+        assert!(
+            up.status.success(),
+            "compose up failed: {}\n--- override ---\n{}",
+            String::from_utf8_lossy(&up.stderr),
+            std::fs::read_to_string(&override_yml).unwrap_or_default()
+        );
+
+        // Reach `web` through the tap.
+        let mut body = String::new();
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Ok(mut sock) = tokio::net::TcpStream::connect(("127.0.0.1", host_port)).await {
+                if sock.write_all(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n").await.is_err() {
+                    continue;
+                }
+                let mut buf = Vec::new();
+                if sock.read_to_end(&mut buf).await.is_ok() && !buf.is_empty() {
+                    body = String::from_utf8_lossy(&buf).to_string();
+                    break;
+                }
+            }
+        }
+
+        // Capture the diagnostics before teardown, so a failure is explainable.
+        let logs = compose(vec!["-p".into(), proj.clone(), "logs".into()])
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let index = cap.join("index.jsonl");
+        let mut records = String::new();
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Ok(c) = std::fs::read_to_string(&index) {
+                if c.contains("\"close\"") {
+                    records = c;
+                    break;
+                }
+            }
+        }
+
+        let _ = compose(vec![
+            "-p".into(), proj.clone(),
+            "down".into(), "-v".into(), "--remove-orphans".into(),
+        ])
+        .output()
+        .await;
+
+        assert!(
+            body.starts_with("HTTP/1.0 200"),
+            "no 200 through the compose tap; body={:?}\n--- compose logs ---\n{}",
+            body.chars().take(120).collect::<String>(),
+            logs
+        );
+        assert!(!records.is_empty(), "no close record in {}", index.display());
+        let close: serde_json::Value = records
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["ev"] == "close")
+            .expect("a close record");
+        assert_eq!(close["challenge"], "compose-chal");
+        assert_eq!(close["team_name"], "team_seven");
+        assert_eq!(close["instance"], proj.as_str());
+        assert!(close["bytes_s2c"].as_u64().unwrap_or(0) > 0, "{}", close);
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn unknown_team_name_renders_empty_not_the_word_none() {
+        let b = tap_service_block(
+            &spec("tcp"), "web", 80, 1234, 7, None, "c",
+            "http://loki/push", "team_id=7",
+        );
+        assert!(b.contains("TEAM_NAME: \"\"\n"), "{}", b);
+        assert!(!b.contains("None"), "{}", b);
+    }
 }
