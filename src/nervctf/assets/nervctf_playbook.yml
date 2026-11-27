@@ -907,9 +907,22 @@
     # there) would need the users-joined variants documented in ctfd_db.rs's user-mode
     # comments (detect_ctfd_mode/sync_solves/recompute_instance_decay) instead; not
     # built here since this deployment's events have all been team-mode so far.
+    # Rendered for whichever CTFd mode `.nervctf.yml` declares. In user-mode
+    # `submissions.team_id` is NULL and the account lives in `users`, so the joins
+    # differ — picking the table at provisioning time keeps one dashboard correct for
+    # both instead of leaving every panel empty in the mode that was not assumed.
     - name: Write NervCTF scoreboard dashboard
       copy:
         content: |
+          {% set is_users = (user_mode | default('teams')) == 'users' %}
+          {% set acct_tbl = 'users' if is_users else 'teams' %}
+          {% set acct_col = 's.user_id' if is_users else 's.team_id' %}
+          {% set acct_col1 = 's1.user_id' if is_users else 's1.team_id' %}
+          {% set acct_col2 = 's2.user_id' if is_users else 's2.team_id' %}
+          {% set acct_filter = "AND a.type = 'user'" if is_users else '' %}
+          {% set acct_count_filter = "AND type = 'user'" if is_users else '' %}
+          {% set acct_word = 'User' if is_users else 'Team' %}
+          {% set acct_words = 'users' if is_users else 'teams' %}
           {
             "title": "NervCTF Scoreboard",
             "uid": "nervctf-scoreboard",
@@ -919,25 +932,15 @@
             "refresh": "30s",
             "panels": [
               {
-                "id": 1,
-                "title": "Team-mode only",
-                "type": "text",
-                "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
-                "options": {
-                  "mode": "markdown",
-                  "content": "This dashboard assumes CTFd team-mode. A user-mode deployment (`submissions.team_id` is always NULL there) will show empty panels — see the user-mode comments in `ctfd_db.rs` for the join pattern a user-mode variant would need."
-                }
-              },
-              {
                 "id": 2,
                 "title": "Cumulative Solves Over Time",
                 "type": "timeseries",
-                "gridPos": { "h": 10, "w": 24, "x": 0, "y": 3 },
+                "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
                 "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
                 "targets": [
                   {
                     "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
-                    "rawSql": "SELECT s.date AS time, t.name AS metric, COUNT(*) OVER (PARTITION BY t.id ORDER BY s.date) AS value FROM submissions s JOIN teams t ON t.id = s.team_id WHERE s.type = 'correct' AND t.hidden = 0 AND t.banned = 0 AND $__timeFilter(s.date) ORDER BY s.date",
+                    "rawSql": "SELECT s.date AS time, a.name AS metric, COUNT(*) OVER (PARTITION BY a.id ORDER BY s.date) AS value FROM submissions s JOIN {{ acct_tbl }} a ON a.id = {{ acct_col }} WHERE s.type = 'correct' AND a.hidden = 0 AND a.banned = 0 {{ acct_filter }} AND $__timeFilter(s.date) ORDER BY s.date",
                     "format": "time_series",
                     "rawQuery": true
                   }
@@ -946,13 +949,14 @@
               {
                 "id": 3,
                 "title": "First Blood",
+                "description": "Earliest correct solve per challenge.",
                 "type": "table",
-                "gridPos": { "h": 10, "w": 12, "x": 0, "y": 13 },
+                "gridPos": { "h": 10, "w": 12, "x": 0, "y": 10 },
                 "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
                 "targets": [
                   {
                     "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
-                    "rawSql": "SELECT c.name AS challenge, t.name AS first_blood_team, first.ts AS solved_at FROM (SELECT challenge_id, team_id, MIN(date) AS ts FROM submissions WHERE type = 'correct' GROUP BY challenge_id) first JOIN challenges c ON c.id = first.challenge_id JOIN teams t ON t.id = first.team_id WHERE t.hidden = 0 AND t.banned = 0 ORDER BY first.ts ASC",
+                    "rawSql": "SELECT c.name AS challenge, a.name AS first_blood_{{ acct_words[:-1] }}, s.date AS solved_at FROM submissions s JOIN challenges c ON c.id = s.challenge_id JOIN {{ acct_tbl }} a ON a.id = {{ acct_col }} WHERE s.type = 'correct' AND a.hidden = 0 AND a.banned = 0 {{ acct_filter }} AND s.date = (SELECT MIN(s2.date) FROM submissions s2 WHERE s2.challenge_id = s.challenge_id AND s2.type = 'correct') ORDER BY s.date ASC",
                     "format": "table",
                     "rawQuery": true
                   }
@@ -961,13 +965,14 @@
               {
                 "id": 4,
                 "title": "Challenge Difficulty",
+                "description": "Solve rate as a share of all active {{ acct_words }}. Lowest first.",
                 "type": "table",
-                "gridPos": { "h": 10, "w": 12, "x": 12, "y": 13 },
+                "gridPos": { "h": 10, "w": 12, "x": 12, "y": 10 },
                 "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
                 "targets": [
                   {
                     "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
-                    "rawSql": "SELECT c.name AS challenge, c.value AS current_value, COUNT(DISTINCT s.team_id) AS solves, (SELECT COUNT(*) FROM teams WHERE hidden = 0 AND banned = 0) AS total_teams, ROUND(100.0 * COUNT(DISTINCT s.team_id) / NULLIF((SELECT COUNT(*) FROM teams WHERE hidden = 0 AND banned = 0), 0), 1) AS solve_rate_pct FROM challenges c LEFT JOIN submissions s ON s.challenge_id = c.id AND s.type = 'correct' LEFT JOIN teams t ON t.id = s.team_id AND t.hidden = 0 AND t.banned = 0 GROUP BY c.id, c.name, c.value ORDER BY solve_rate_pct ASC",
+                    "rawSql": "SELECT c.name AS challenge, c.value AS current_value, COUNT(DISTINCT a.id) AS solves, (SELECT COUNT(*) FROM {{ acct_tbl }} WHERE hidden = 0 AND banned = 0 {{ acct_count_filter }}) AS total_{{ acct_words }}, ROUND(100.0 * COUNT(DISTINCT a.id) / NULLIF((SELECT COUNT(*) FROM {{ acct_tbl }} WHERE hidden = 0 AND banned = 0 {{ acct_count_filter }}), 0), 1) AS solve_rate_pct FROM challenges c LEFT JOIN submissions s ON s.challenge_id = c.id AND s.type = 'correct' LEFT JOIN {{ acct_tbl }} a ON a.id = {{ acct_col }} AND a.hidden = 0 AND a.banned = 0 GROUP BY c.id, c.name, c.value ORDER BY solve_rate_pct ASC",
                     "format": "table",
                     "rawQuery": true
                   }
@@ -1060,9 +1065,23 @@
     # Ranked roughly by signal-to-noise: the monitor's own findings first (it knows
     # which flag belongs to which team's instance, so those are near-certain), then
     # the CTFd-derived heuristics, which need an operator's judgement.
+    # ── NervCTF Integrity dashboard ────────────────────────────────────────────
+    # The anti-cheat view. Every panel runs on data that already exists — the
+    # monitor's event log and CTFd's `submissions` table — so none of it depends on
+    # traffic capture, and it covers standard challenges too. Account joins are
+    # rendered for the configured CTFd mode (see the scoreboard note above).
     - name: Write NervCTF integrity dashboard
       copy:
         content: |
+          {% set is_users = (user_mode | default('teams')) == 'users' %}
+          {% set acct_tbl = 'users' if is_users else 'teams' %}
+          {% set acct_col = 's.user_id' if is_users else 's.team_id' %}
+          {% set acct_col1 = 's1.user_id' if is_users else 's1.team_id' %}
+          {% set acct_col2 = 's2.user_id' if is_users else 's2.team_id' %}
+          {% set acct_filter = "AND a.type = 'user'" if is_users else '' %}
+          {% set acct_count_filter = "AND type = 'user'" if is_users else '' %}
+          {% set acct_word = 'User' if is_users else 'Team' %}
+          {% set acct_words = 'users' if is_users else 'teams' %}
           {
             "title": "NervCTF Integrity",
             "uid": "nervctf-integrity",
@@ -1078,22 +1097,20 @@
                 "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
                 "options": {
                   "mode": "markdown",
-                  "content": "Panels are ordered by confidence, strongest first.\n\n**Near-certain** (monitor-derived, each instance has a unique flag): *Foreign flag submitted* and *Solved without an instance*. A team cannot solve an instance challenge it was never given an instance of.\n\n**Needs judgement** (CTFd-derived heuristics): the rest. Known false positives \u2014 shared IPs are normal behind one NAT, campus network or VPN; simultaneous solves cluster at challenge release; a challenge converted from standard to instance mid-event will show spurious *Solved without an instance* rows. Confirm before accusing anyone.\n\nTeam-mode only. In CTFd user-mode `submissions.team_id` is NULL and the CTFd-derived panels will be empty."
+                  "content": "Panels are ordered by confidence, strongest first.\n\n**Near-certain** (monitor-derived, each instance gets a unique flag): *Foreign flag submitted* and *Solved without an instance*. An account cannot solve an instance challenge it was never given an instance of.\n\n**Needs judgement** (CTFd-derived heuristics): the rest. Known false positives \u2014 shared IPs are normal behind one NAT, campus network or VPN; simultaneous solves cluster at challenge release; a challenge converted from standard to instance mid-event shows spurious *Solved without an instance* rows. Confirm before accusing anyone.\n\nRendered for CTFd **{{ acct_words }}** mode. For the actual bytes a player sent, see the **NervCTF Captures** dashboard."
                 }
               },
               {
                 "id": 2,
                 "title": "Foreign flag submitted (near-certain)",
-                "description": "A team submitted a flag that belongs to another team's instance. The monitor generates a unique flag per instance, so this is direct evidence of sharing.",
+                "description": "An account submitted a flag belonging to another account's instance. Unique per-instance flags make this direct evidence.",
                 "type": "table",
                 "gridPos": { "h": 9, "w": 24, "x": 0, "y": 6 },
                 "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
                 "targets": [
                   {
                     "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
-                    "type": "json",
-                    "source": "url",
-                    "format": "table",
+                    "type": "json", "source": "url", "format": "table",
                     "url": "/api/v1/admin/attempts?alerts_only=true",
                     "url_options": { "method": "GET" },
                     "root_selector": "$"
@@ -1103,16 +1120,14 @@
               {
                 "id": 3,
                 "title": "Solved without an instance (near-certain)",
-                "description": "Correct solve for an instance challenge with no instance.requested event for that team, or a solve timestamped before their first request. There was nothing for them to solve.",
+                "description": "Correct solve for an instance challenge with no instance.requested event for that account, or a solve timestamped before their first request.",
                 "type": "table",
                 "gridPos": { "h": 9, "w": 24, "x": 0, "y": 15 },
                 "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
                 "targets": [
                   {
                     "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
-                    "type": "json",
-                    "source": "url",
-                    "format": "table",
+                    "type": "json", "source": "url", "format": "table",
                     "url": "/api/v1/admin/integrity",
                     "url_options": { "method": "GET" },
                     "root_selector": "$"
@@ -1121,15 +1136,15 @@
               },
               {
                 "id": 4,
-                "title": "Same wrong flag submitted by multiple teams",
-                "description": "Two teams submitting the identical incorrect string for the same challenge shared an answer. One of the strongest CTFd-only signals, because a wrong guess is not independently reproducible.",
+                "title": "Same wrong flag submitted by multiple {{ acct_words }}",
+                "description": "An identical incorrect string for the same challenge means a shared answer. A wrong guess is not independently reproducible, so this is the strongest CTFd-only signal.",
                 "type": "table",
                 "gridPos": { "h": 10, "w": 24, "x": 0, "y": 24 },
                 "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
                 "targets": [
                   {
                     "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
-                    "rawSql": "SELECT c.name AS challenge, s.provided AS submitted_flag, COUNT(DISTINCT s.team_id) AS teams, GROUP_CONCAT(DISTINCT t.name ORDER BY t.name SEPARATOR ', ') AS team_names, MIN(s.date) AS first_seen FROM submissions s JOIN teams t ON t.id = s.team_id JOIN challenges c ON c.id = s.challenge_id WHERE s.type = 'incorrect' AND t.hidden = 0 AND t.banned = 0 AND CHAR_LENGTH(s.provided) >= 8 GROUP BY s.challenge_id, c.name, s.provided HAVING teams > 1 ORDER BY teams DESC, first_seen ASC LIMIT 200",
+                    "rawSql": "SELECT c.name AS challenge, s.provided AS submitted_flag, COUNT(DISTINCT a.id) AS {{ acct_words }}, GROUP_CONCAT(DISTINCT a.name ORDER BY a.name SEPARATOR ', ') AS names, MIN(s.date) AS first_seen FROM submissions s JOIN {{ acct_tbl }} a ON a.id = {{ acct_col }} JOIN challenges c ON c.id = s.challenge_id WHERE s.type = 'incorrect' AND a.hidden = 0 AND a.banned = 0 {{ acct_filter }} AND CHAR_LENGTH(s.provided) >= 8 GROUP BY s.challenge_id, c.name, s.provided HAVING {{ acct_words }} > 1 ORDER BY {{ acct_words }} DESC, first_seen ASC LIMIT 200",
                     "format": "table",
                     "rawQuery": true
                   }
@@ -1137,15 +1152,15 @@
               },
               {
                 "id": 5,
-                "title": "Submission IP shared across teams",
-                "description": "CTFd records the submitter IP. The same address submitting for several teams suggests one person on multiple accounts. Expect false positives behind a shared NAT, campus network or VPN.",
+                "title": "Submission IP shared across {{ acct_words }}",
+                "description": "CTFd records the submitter IP. One address submitting for several accounts suggests one person on multiple accounts. Expect false positives behind shared NAT, campus networks or VPNs.",
                 "type": "table",
                 "gridPos": { "h": 10, "w": 24, "x": 0, "y": 34 },
                 "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
                 "targets": [
                   {
                     "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
-                    "rawSql": "SELECT s.ip AS ip, COUNT(DISTINCT s.team_id) AS teams, GROUP_CONCAT(DISTINCT t.name ORDER BY t.name SEPARATOR ', ') AS team_names, COUNT(*) AS submissions, MIN(s.date) AS first_seen, MAX(s.date) AS last_seen FROM submissions s JOIN teams t ON t.id = s.team_id WHERE s.ip IS NOT NULL AND s.ip <> '' AND t.hidden = 0 AND t.banned = 0 GROUP BY s.ip HAVING teams > 1 ORDER BY teams DESC, submissions DESC LIMIT 200",
+                    "rawSql": "SELECT s.ip AS ip, COUNT(DISTINCT a.id) AS {{ acct_words }}, GROUP_CONCAT(DISTINCT a.name ORDER BY a.name SEPARATOR ', ') AS names, COUNT(*) AS submissions, MIN(s.date) AS first_seen, MAX(s.date) AS last_seen FROM submissions s JOIN {{ acct_tbl }} a ON a.id = {{ acct_col }} WHERE s.ip IS NOT NULL AND s.ip <> '' AND a.hidden = 0 AND a.banned = 0 {{ acct_filter }} GROUP BY s.ip HAVING {{ acct_words }} > 1 ORDER BY {{ acct_words }} DESC, submissions DESC LIMIT 200",
                     "format": "table",
                     "rawQuery": true
                   }
@@ -1154,14 +1169,14 @@
               {
                 "id": 6,
                 "title": "Near-simultaneous solves (same challenge, within 3 min)",
-                "description": "Team pairs solving the same challenge close together. Clusters legitimately at challenge release, so read it alongside the first-blood times on the Scoreboard dashboard.",
+                "description": "Account pairs solving the same challenge close together. Clusters legitimately at challenge release, so read it alongside First Blood on the Scoreboard.",
                 "type": "table",
                 "gridPos": { "h": 10, "w": 24, "x": 0, "y": 44 },
                 "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
                 "targets": [
                   {
                     "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
-                    "rawSql": "SELECT c.name AS challenge, ta.name AS team_a, tb.name AS team_b, a.date AS first_solved_at, ABS(TIMESTAMPDIFF(SECOND, a.date, b.date)) AS seconds_apart FROM submissions a JOIN submissions b ON b.challenge_id = a.challenge_id AND b.type = 'correct' AND b.team_id > a.team_id AND ABS(TIMESTAMPDIFF(SECOND, a.date, b.date)) <= 180 JOIN challenges c ON c.id = a.challenge_id JOIN teams ta ON ta.id = a.team_id JOIN teams tb ON tb.id = b.team_id WHERE a.type = 'correct' AND ta.hidden = 0 AND ta.banned = 0 AND tb.hidden = 0 AND tb.banned = 0 ORDER BY seconds_apart ASC LIMIT 200",
+                    "rawSql": "SELECT c.name AS challenge, a1.name AS first_account, a2.name AS second_account, s1.date AS first_solved_at, ABS(TIMESTAMPDIFF(SECOND, s1.date, s2.date)) AS seconds_apart FROM submissions s1 JOIN {{ acct_tbl }} a1 ON a1.id = {{ acct_col1 }} JOIN submissions s2 ON s2.challenge_id = s1.challenge_id AND s2.type = 'correct' AND ABS(TIMESTAMPDIFF(SECOND, s1.date, s2.date)) <= 180 JOIN {{ acct_tbl }} a2 ON a2.id = {{ acct_col2 }} AND a2.id > a1.id JOIN challenges c ON c.id = s1.challenge_id WHERE s1.type = 'correct' AND a1.hidden = 0 AND a1.banned = 0 AND a2.hidden = 0 AND a2.banned = 0 ORDER BY seconds_apart ASC LIMIT 200",
                     "format": "table",
                     "rawQuery": true
                   }
@@ -1170,14 +1185,14 @@
               {
                 "id": 7,
                 "title": "Flag brute-forcing",
-                "description": "Teams with a high rate of incorrect submissions on one challenge — scripted guessing rather than solving. Only rows with at least 20 wrong attempts are shown.",
+                "description": "Accounts with a high rate of incorrect submissions on one challenge \u2014 scripted guessing rather than solving. Only 20+ wrong attempts shown.",
                 "type": "table",
                 "gridPos": { "h": 10, "w": 24, "x": 0, "y": 54 },
                 "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
                 "targets": [
                   {
                     "datasource": { "type": "mysql", "uid": "ctfd-mysql" },
-                    "rawSql": "SELECT t.name AS team, c.name AS challenge, COUNT(*) AS incorrect, TIMESTAMPDIFF(SECOND, MIN(s.date), MAX(s.date)) AS window_seconds, ROUND(COUNT(*) * 60.0 / GREATEST(TIMESTAMPDIFF(SECOND, MIN(s.date), MAX(s.date)), 1), 1) AS per_minute FROM submissions s JOIN teams t ON t.id = s.team_id JOIN challenges c ON c.id = s.challenge_id WHERE s.type = 'incorrect' AND t.hidden = 0 AND t.banned = 0 GROUP BY t.id, t.name, c.id, c.name HAVING incorrect >= 20 ORDER BY per_minute DESC LIMIT 100",
+                    "rawSql": "SELECT a.name AS account, c.name AS challenge, COUNT(*) AS incorrect, TIMESTAMPDIFF(SECOND, MIN(s.date), MAX(s.date)) AS window_seconds, ROUND(COUNT(*) * 60.0 / GREATEST(TIMESTAMPDIFF(SECOND, MIN(s.date), MAX(s.date)), 1), 1) AS per_minute FROM submissions s JOIN {{ acct_tbl }} a ON a.id = {{ acct_col }} JOIN challenges c ON c.id = s.challenge_id WHERE s.type = 'incorrect' AND a.hidden = 0 AND a.banned = 0 {{ acct_filter }} GROUP BY a.id, a.name, c.id, c.name HAVING incorrect >= 20 ORDER BY per_minute DESC LIMIT 100",
                     "format": "table",
                     "rawQuery": true
                   }
@@ -1186,6 +1201,178 @@
             ]
           }
         dest: "{{ ctfd_path }}/grafana/provisioning/dashboards/integrity.json"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    # ── NervCTF Captures dashboard ─────────────────────────────────────────────
+    # The request/response view over `nervctf-tap` captures, served as JSON by the
+    # monitor (/api/v1/admin/captures) and read through the Infinity datasource.
+    #
+    # The bytes are deliberately NOT shipped to Loki: base64 inflates them, a label per
+    # session would wreck cardinality, and a byte stream in a log panel is unreadable.
+    # Serving them on demand keeps Loki for logs and still gives a Grafana view.
+    - name: Write NervCTF captures dashboard
+      copy:
+        content: |
+          {
+            "title": "NervCTF Captures",
+            "uid": "nervctf-captures",
+            "schemaVersion": 39,
+            "editable": true,
+            "time": { "from": "now-6h", "to": "now" },
+            "refresh": "30s",
+            "templating": {
+              "list": [
+                {
+                  "name": "session",
+                  "type": "textbox",
+                  "label": "Session",
+                  "description": "Click a row in Sessions to load it, or paste a session id.",
+                  "query": "",
+                  "current": { "text": "", "value": "" }
+                }
+              ]
+            },
+            "panels": [
+              {
+                "id": 1,
+                "title": "How to use",
+                "type": "text",
+                "gridPos": { "h": 5, "w": 24, "x": 0, "y": 0 },
+                "options": {
+                  "mode": "markdown",
+                  "content": "Every connection to a captured instance is one **session**. Click a row in *Sessions* to load its traffic into the panels below, or paste a session id into the **Session** box at the top.\\n\\n*Exchange* shows each relayed chunk in order: `client -> challenge` is what the player sent, `challenge -> client` is the reply. `offset_ms` is time since the session opened, which is what makes an interactive pwn session readable. Non-printable bytes are escaped (`\\\\x00`), so binary payloads stay legible without a hex viewer.\\n\\nPreviews are capped at 512 bytes per chunk and 500 chunks per session; `truncated` on the raw endpoint says when more exists. For the complete stream use `nervctf-tap dump` on the host."
+                }
+              },
+              {
+                "id": 2,
+                "title": "Sessions",
+                "description": "Newest first. fp_c2s is a fingerprint of the opening client bytes — the same value across two accounts means a byte-identical opening payload.",
+                "type": "table",
+                "gridPos": { "h": 11, "w": 24, "x": 0, "y": 5 },
+                "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                "targets": [
+                  {
+                    "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                    "type": "json", "source": "url", "format": "table",
+                    "url": "/api/v1/admin/captures?limit=500",
+                    "url_options": { "method": "GET" },
+                    "root_selector": "$"
+                  }
+                ],
+                "transformations": [
+                  {
+                    "id": "organize",
+                    "options": {
+                      "excludeByName": {
+                        "ev": true, "client": true, "started_us": true, "ended_us": true,
+                        "duration_us": true, "ttfb_us": true, "file": true, "instance": true,
+                        "recorded_c2s": true, "recorded_s2c": true, "fp_bytes": true,
+                        "proto": true, "team_id": true
+                      },
+                      "indexByName": {
+                        "session": 0, "state": 1, "challenge": 2, "team_name": 3,
+                        "client_ip": 4, "bytes_c2s": 5, "bytes_s2c": 6, "bytes_total": 7,
+                        "duration_ms": 8, "dropped_frames": 9, "capped": 10,
+                        "fp_c2s": 11, "error": 12
+                      },
+                      "renameByName": {
+                        "team_name": "account", "client_ip": "client",
+                        "bytes_c2s": "sent", "bytes_s2c": "received", "bytes_total": "total",
+                        "duration_ms": "duration (ms)", "dropped_frames": "dropped"
+                      }
+                    }
+                  }
+                ],
+                "fieldConfig": {
+                  "defaults": {},
+                  "overrides": [
+                    {
+                      "matcher": { "id": "byName", "options": "session" },
+                      "properties": [
+                        {
+                          "id": "links",
+                          "value": [
+                            {
+                              "title": "Load this session below",
+                              "url": "/d/nervctf-captures/nervctf-captures?var-session=${__value.raw}",
+                              "targetBlank": false
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "id": 3,
+                "title": "Exchange — $session",
+                "description": "Each relayed chunk in wire order, both directions.",
+                "type": "table",
+                "gridPos": { "h": 14, "w": 24, "x": 0, "y": 16 },
+                "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                "targets": [
+                  {
+                    "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                    "type": "json", "source": "url", "format": "table",
+                    "url": "/api/v1/admin/captures/frames?session=$session&limit=500",
+                    "url_options": { "method": "GET" },
+                    "root_selector": "$.frames"
+                  }
+                ],
+                "transformations": [
+                  {
+                    "id": "organize",
+                    "options": {
+                      "excludeByName": { "dir": true, "ts_ms": true },
+                      "indexByName": {
+                        "seq": 0, "offset_ms": 1, "direction": 2, "bytes": 3,
+                        "gap": 4, "preview": 5
+                      },
+                      "renameByName": { "offset_ms": "+ms", "preview": "payload" }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": 4,
+                "title": "Client -> challenge, reassembled",
+                "description": "Everything the player sent, in order, as one blob. For an HTTP challenge this is the raw request.",
+                "type": "table",
+                "gridPos": { "h": 9, "w": 12, "x": 0, "y": 30 },
+                "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                "targets": [
+                  {
+                    "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                    "type": "json", "source": "url", "format": "table",
+                    "url": "/api/v1/admin/captures/frames?session=$session&dir=c2s",
+                    "url_options": { "method": "GET" },
+                    "root_selector": "$"
+                  }
+                ]
+              },
+              {
+                "id": 5,
+                "title": "Challenge -> client, reassembled",
+                "description": "Everything the challenge replied. For an HTTP challenge this is the raw response.",
+                "type": "table",
+                "gridPos": { "h": 9, "w": 12, "x": 12, "y": 30 },
+                "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                "targets": [
+                  {
+                    "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "nervctf-infinity" },
+                    "type": "json", "source": "url", "format": "table",
+                    "url": "/api/v1/admin/captures/frames?session=$session&dir=s2c",
+                    "url_options": { "method": "GET" },
+                    "root_selector": "$"
+                  }
+                ]
+              }
+            ]
+          }
+        dest: "{{ ctfd_path }}/grafana/provisioning/dashboards/captures.json"
         owner: "{{ docker_user }}"
         group: docker
         mode: "0644"

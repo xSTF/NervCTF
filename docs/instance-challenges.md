@@ -492,13 +492,30 @@ In split-machine mode the capture files land on the **runner** host. The monitor
 the capture directory only in single-machine mode; reading captures over SSH is not
 wired up yet.
 
-### What is not in Grafana
+### Viewing captures
 
-Capture bytes are deliberately not shipped to Loki — base64 inflates them, per-session
-labels would explode cardinality, and a byte stream in a log panel is unreadable. Grafana's
-**NervCTF Container Logs** dashboard shows instance container *stdout/stderr* (whatever the
-challenge itself printed, which for many `nc`/pwn challenges is nothing). Request/response
-inspection is a session-browsing problem and belongs over the capture files.
+**Grafana → NervCTF Captures.** *Sessions* lists every connection to a captured
+instance (account, challenge, client IP, bytes each way, duration, drop/cap flags, and
+`fp_c2s`). Click a session id and the panels below load its traffic:
+
+- *Exchange* — every relayed chunk in wire order, with `+ms` since the session opened,
+  direction (`client -> challenge` / `challenge -> client`), size and payload.
+  Non-printable bytes are escaped, so a binary pwn payload stays legible.
+- *Client -> challenge, reassembled* and *Challenge -> client, reassembled* — each
+  direction as one blob. For an HTTP challenge, that is the raw request and response.
+
+It reads the monitor's `/api/v1/admin/captures` and `/api/v1/admin/captures/frames`
+through the Infinity datasource. Previews are capped at 512 bytes per chunk and 500
+chunks per session; the frames endpoint reports `truncated` when there is more.
+
+The bytes are still not shipped to Loki — base64 inflates them, a label per session
+would wreck cardinality, and a byte stream in a log panel is unreadable. Serving them on
+demand keeps Loki for logs and still gives a Grafana view. Grafana's **NervCTF Container
+Logs** remains what it says: container stdout/stderr, which for most `nc`/pwn challenges
+is nothing.
+
+For the complete stream beyond those caps, read the file directly on the host with
+`nervctf-tap dump`.
 
 In split-machine mode, the runner host's Docker daemon (which does the actual Loki push, from
 its own network namespace) reaches Loki on the primary host over loopback through a

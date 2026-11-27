@@ -845,8 +845,9 @@ pub fn list_flag_attempts(db: &Db, limit: i64) -> Result<Vec<Value>> {
 /// `instance.requested` events are used rather than the `instances` table because
 /// instance rows are deleted on teardown, while the event log is durable.
 ///
-/// Team-mode only: in CTFd user-mode `ctfd_solves.team_id` carries the user id, so the
-/// `ctfd_teams` join yields no name (the finding still lists, with a null team_name).
+/// Works in both CTFd modes. In user-mode `ctfd_solves.team_id` carries the *user* id
+/// (see `sync_solves`), so the display name is resolved from `ctfd_teams` or
+/// `ctfd_users`, whichever holds it.
 ///
 /// False positives to expect: a challenge converted from standard to instance
 /// mid-event, and solves imported or awarded by an admin. Both are worth a look anyway.
@@ -854,10 +855,11 @@ pub fn list_integrity_findings(db: &Db) -> Result<Vec<Value>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
         "SELECT 'solved_without_instance' AS signal,
-                cs.challenge_name, cs.team_id, ct.name, cs.solved_at,
-                'no instance.requested event for this team' AS detail
+                cs.challenge_name, cs.team_id, COALESCE(ct.name, cu.name), cs.solved_at,
+                'no instance.requested event for this account' AS detail
          FROM ctfd_solves cs
          LEFT JOIN ctfd_teams ct ON ct.id = cs.team_id
+         LEFT JOIN ctfd_users cu ON cu.id = cs.team_id
          WHERE EXISTS (SELECT 1 FROM instance_configs ic
                        WHERE ic.challenge_name = cs.challenge_name)
            AND NOT EXISTS (SELECT 1 FROM events e
@@ -866,15 +868,16 @@ pub fn list_integrity_findings(db: &Db) -> Result<Vec<Value>> {
                              AND e.team_id = cs.team_id)
          UNION ALL
          SELECT 'solved_before_request' AS signal,
-                cs.challenge_name, cs.team_id, ct.name, cs.solved_at,
+                cs.challenge_name, cs.team_id, COALESCE(ct.name, cu.name), cs.solved_at,
                 'first instance request at ' || MIN(e.created_at) AS detail
          FROM ctfd_solves cs
          JOIN events e ON e.event_type = 'instance.requested'
                       AND e.challenge_name = cs.challenge_name
                       AND e.team_id = cs.team_id
          LEFT JOIN ctfd_teams ct ON ct.id = cs.team_id
+         LEFT JOIN ctfd_users cu ON cu.id = cs.team_id
          WHERE cs.solved_at IS NOT NULL
-         GROUP BY cs.challenge_name, cs.team_id, ct.name, cs.solved_at
+         GROUP BY cs.challenge_name, cs.team_id, ct.name, cu.name, cs.solved_at
          HAVING MIN(e.created_at) > cs.solved_at
          ORDER BY 5 DESC",
     )?;
@@ -1492,5 +1495,55 @@ mod integrity_tests {
         assert_eq!(f["challenge_name"], "web-chal");
         assert_eq!(f["solved_at"], "2026-01-01 10:05:00");
         assert!(f["detail"].as_str().unwrap().contains("no instance.requested"));
+    }
+}
+
+#[cfg(test)]
+mod integrity_mode_tests {
+    use super::*;
+
+    fn db() -> Db {
+        open(":memory:").expect("open in-memory db")
+    }
+    fn exec(db: &Db, sql: &str) {
+        db.lock().unwrap().execute_batch(sql).expect(sql);
+    }
+
+    /// CTFd user-mode: `sync_solves` stores the *user* id in `ctfd_solves.team_id`, so
+    /// the finding must still carry a readable name. Before this, user-mode events got
+    /// findings with a null name and nothing to act on.
+    #[test]
+    fn user_mode_findings_resolve_the_user_name() {
+        let db = db();
+        exec(
+            &db,
+            "INSERT INTO instance_configs (challenge_name, ctfd_id, backend, config_json)
+               VALUES ('web-chal', 1, 'docker', '{}');
+             INSERT INTO ctfd_users (id, name, team_id) VALUES (42, 'solo_player', NULL);
+             INSERT INTO ctfd_solves (challenge_name, team_id, solved_at)
+               VALUES ('web-chal', 42, '2026-01-01 10:00:00');",
+        );
+        let f = list_integrity_findings(&db).unwrap();
+        assert_eq!(f.len(), 1, "{:?}", f);
+        assert_eq!(f[0]["team_name"], "solo_player");
+        assert_eq!(f[0]["signal"], "solved_without_instance");
+    }
+
+    /// Team-mode must keep preferring the team name even when a user shares the id.
+    #[test]
+    fn team_mode_still_prefers_the_team_name() {
+        let db = db();
+        exec(
+            &db,
+            "INSERT INTO instance_configs (challenge_name, ctfd_id, backend, config_json)
+               VALUES ('web-chal', 1, 'docker', '{}');
+             INSERT INTO ctfd_teams (id, name) VALUES (7, 'Team Seven');
+             INSERT INTO ctfd_users (id, name, team_id) VALUES (7, 'coincidental_user', 7);
+             INSERT INTO ctfd_solves (challenge_name, team_id, solved_at)
+               VALUES ('web-chal', 7, '2026-01-01 10:00:00');",
+        );
+        let f = list_integrity_findings(&db).unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0]["team_name"], "Team Seven");
     }
 }

@@ -116,12 +116,22 @@ TLS and HTTP alike — see
 [instance challenges](instance-challenges.md#traffic-capture-capture) for the per-challenge
 settings and the one behavioural caveat (the challenge sees the tap's address as the client).
 
-The monitor launches and tears down the sidecar; there is no monitor-side route for reading
-captures yet. On the host, read them with `nervctf-tap dump <file.ntap>`.
+The monitor launches and tears down the sidecar, and serves the captures back:
 
-Capture bytes are **not** sent to Loki. Loki holds instance container stdout/stderr only,
-viewed in Grafana's **NervCTF Container Logs** dashboard, templated on
-`$challenge`/`$team_id`/`$team_name`.
+| Route | Returns |
+|---|---|
+| `GET /api/v1/admin/captures?limit=N` | sessions, newest first, with account/challenge/client IP/byte counts/`fp_c2s` |
+| `GET /api/v1/admin/captures/frames?session=<id>` | that session decoded into frames: direction, `offset_ms`, size, printable preview |
+| `GET /api/v1/admin/captures/frames?session=<id>&dir=c2s\|s2c` | one direction reassembled as text |
+
+`session` is resolved through the capture index, never used as a filesystem path, so it
+cannot address a file the tap did not write. Previews are capped at 512 bytes per frame
+and 500 frames per session (`truncated` says when more exists); `nervctf-tap dump` on the
+host gives the complete stream.
+
+Grafana's **NervCTF Captures** dashboard is built on these routes via the Infinity
+datasource. Capture bytes are **not** sent to Loki — Loki holds instance container
+stdout/stderr only, shown in **NervCTF Container Logs**.
 
 **Loki itself** is deployed by `nervctf setup`/`setup --upgrade` alongside
 Prometheus/Grafana, always bound `127.0.0.1:3100` on the primary (CTFd) host — never exposed

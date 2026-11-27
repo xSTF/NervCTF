@@ -3,6 +3,8 @@
 //! Routes:
 //!   GET  /health                         — liveness check (no auth)
 //!   GET  /api/v1/admin/integrity         — integrity findings (monitor token)
+//!   GET  /api/v1/admin/captures          — tap sessions (monitor token)
+//!   GET  /api/v1/admin/captures/frames   — one session's frames (monitor token)
 //!   GET  /metrics                        — Prometheus text-format metrics (no auth)
 //!   GET  /admin                          — admin dashboard (monitor token via ?token= or header)
 //!   GET  /instance/:name                 — HTML player page
@@ -42,6 +44,7 @@
 //!   MONITOR_BIND       — bind address (default: 0.0.0.0)
 //!   DB_PATH            — SQLite database path (default: ./monitor.db)
 
+mod captures;
 mod ctfd_db;
 mod db;
 mod instance;
@@ -402,6 +405,8 @@ async fn main() -> Result<()> {
         .route("/api/v1/admin/attempts", get(admin_attempts_handler))
         .route("/api/v1/admin/solves", get(admin_solves_handler))
         .route("/api/v1/admin/integrity", get(admin_integrity_handler))
+        .route("/api/v1/admin/captures", get(admin_captures_handler))
+        .route("/api/v1/admin/captures/frames", get(admin_capture_frames_handler))
         .route("/api/v1/admin/config", get(admin_config_handler))
         .route("/api/v1/admin/probe", get(admin_probe_handler))
         .route("/api/v1/admin/tokens", get(list_tokens_handler).post(create_token_handler))
@@ -2239,6 +2244,74 @@ async fn admin_attempts_handler(
     match result {
         Ok(Ok(list)) => Json(json!(list)).into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// `GET /api/v1/admin/captures` — tap sessions, newest first, for the Grafana
+/// "NervCTF Captures" dashboard. `limit` caps the rows (default 500).
+async fn admin_captures_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !check_any_auth(&headers, &state.db).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(500);
+    // Blocking file I/O over a directory tree — keep it off the async executor.
+    match tokio::task::spawn_blocking(move || captures::list_sessions(&captures::base_dir(), limit))
+        .await
+    {
+        Ok(Ok(list)) => Json(json!(list)).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// `GET /api/v1/admin/captures/frames?session=<id>` — one session decoded into frames
+/// (direction, relative timing, size, printable preview). This is the request/response
+/// view. `dir=c2s|s2c` instead returns that one direction reassembled as text.
+///
+/// `session` is resolved through the capture index, never used as a path, so it cannot
+/// address a file the tap did not write.
+async fn admin_capture_frames_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !check_any_auth(&headers, &state.db).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+    let Some(session) = params.get("session").cloned().filter(|s| !s.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "session query parameter is required"})),
+        )
+            .into_response();
+    };
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(500);
+    let dir = params.get("dir").cloned();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let base = captures::base_dir();
+        match dir.as_deref() {
+            Some(d @ ("c2s" | "s2c")) => captures::read_stream(&base, &session, d),
+            _ => captures::read_frames(&base, &session, limit),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(v)) => Json(v).into_response(),
+        // An unknown session is the caller's mistake, not a server fault.
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
