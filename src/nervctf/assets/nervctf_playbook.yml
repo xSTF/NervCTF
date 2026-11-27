@@ -84,14 +84,32 @@
         name: docker
         state: present
 
+    - name: Look up the docker user's current login shell
+      getent:
+        database: passwd
+        key: "{{ docker_user }}"
+        fail_key: false
+      register: docker_user_passwd
+      changed_when: false
+
+    # `shell:` is deliberately conditional rather than a hardcoded /bin/bash. The
+    # `user` module enforces whatever it is given on *every* run, so hardcoding it
+    # rewrote the login shell of an already-existing account each time `nervctf setup`
+    # ran — and since `docker_user` defaults to `ansible_user`, on a single-machine
+    # deployment that is usually root, whose shell the operator may well have changed
+    # on purpose. Preserve whatever the account already uses; only pick a default when
+    # this run is actually creating the account.
     - name: Ensure docker user exists
       user:
         name: "{{ docker_user }}"
         groups: docker
         append: yes
-        shell: /bin/bash
         state: present
         create_home: yes
+        shell: >-
+          {{ (docker_user_passwd.ansible_facts.getent_passwd | default({})).get(docker_user)[5]
+             if (docker_user_passwd.ansible_facts.getent_passwd | default({})).get(docker_user)
+             else '/bin/bash' }}
 
     # ── SSH key ────────────────────────────────────────────────────────────────
     # `ssh_pubkey` (public key contents) is resolved by the CLI from the private
@@ -1563,14 +1581,32 @@
         name: docker
         state: present
 
+    - name: Look up the docker user's current login shell
+      getent:
+        database: passwd
+        key: "{{ docker_user }}"
+        fail_key: false
+      register: docker_user_passwd
+      changed_when: false
+
+    # `shell:` is deliberately conditional rather than a hardcoded /bin/bash. The
+    # `user` module enforces whatever it is given on *every* run, so hardcoding it
+    # rewrote the login shell of an already-existing account each time `nervctf setup`
+    # ran — and since `docker_user` defaults to `ansible_user`, on a single-machine
+    # deployment that is usually root, whose shell the operator may well have changed
+    # on purpose. Preserve whatever the account already uses; only pick a default when
+    # this run is actually creating the account.
     - name: Ensure docker user exists
       user:
         name: "{{ docker_user }}"
         groups: docker
         append: yes
-        shell: /bin/bash
         state: present
         create_home: yes
+        shell: >-
+          {{ (docker_user_passwd.ansible_facts.getent_passwd | default({})).get(docker_user)[5]
+             if (docker_user_passwd.ansible_facts.getent_passwd | default({})).get(docker_user)
+             else '/bin/bash' }}
 
     # ── SSH server ─────────────────────────────────────────────────────────────
     - name: Ensure openssh-server is installed
