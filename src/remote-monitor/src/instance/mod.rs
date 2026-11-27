@@ -67,6 +67,36 @@ pub fn capture_mode(config: &Value) -> CaptureMode {
     }
 }
 
+/// Whether this instance actually gets a tap sidecar.
+///
+/// `capture_mode` says what the challenge asked for; this also requires the sidecar
+/// image to be present on the host that runs challenge containers. The playbook builds
+/// `nervctf-tap:latest` locally, and only when `nervctf setup` found a binary to ship,
+/// so a deployment can legitimately not have it. The image is in no registry, so
+/// referencing it anyway fails the whole provision with a misleading "pull access
+/// denied" from Docker Hub.
+///
+/// Degrading to no capture is the right failure here, and is checked *before* the
+/// primary port is withheld from the app container, so the instance is published
+/// directly and stays playable. Only the capture is lost; the app container still
+/// ships stdout/stderr to Loki. (A tap that fails to start *after* the app has been
+/// left unpublished is a different case — there the provision is torn down, because
+/// the instance would be unreachable.)
+async fn tap_enabled(config: &Value, challenge_name: &str, runner_ssh: Option<&str>) -> bool {
+    if capture_mode(config) != CaptureMode::Tap {
+        return false;
+    }
+    if docker::tap_image_available(runner_ssh).await {
+        return true;
+    }
+    tracing::warn!(
+        "provision: '{}' asks for capture but image {} is missing on the challenge host —          provisioning WITHOUT capture. To enable it, build the tap          (cargo build --release --target x86_64-unknown-linux-musl -p nervctf-tap) and          re-run `nervctf setup`.",
+        challenge_name,
+        docker::TAP_IMAGE
+    );
+    false
+}
+
 /// The connection type to show players for the primary port: `"udp"` overrides the
 /// challenge's declared `connection` (nc/http/ssh) whenever the primary port itself is
 /// UDP, since `nc -u` (not plain `nc`) is required to reach it.
@@ -220,7 +250,7 @@ pub async fn provision(
             // container joins a dedicated per-instance network and is not published
             // directly; the tap is published on `host_port` instead and forwards to the
             // app by container name.
-            let tap = capture_mode(config) == CaptureMode::Tap;
+            let tap = tap_enabled(config, challenge_name, runner_ssh).await;
             let tap_net = tap.then(|| docker::instance_network_name(&cname));
             if let Some(net) = &tap_net {
                 docker::create_network(net, runner_ssh).await?;
@@ -279,7 +309,7 @@ pub async fn provision(
                 let tap_result = async {
                     docker::ensure_dir(&cap_dir, runner_ssh).await?;
                     docker::run_container(
-                        "nervctf-tap:latest",
+                        docker::TAP_IMAGE,
                         &tap_name,
                         &tap_port_mappings,
                         None,
@@ -403,11 +433,13 @@ pub async fn provision(
             let team_name = crate::db::get_identity_name(db, team_id, ctfd_mode).unwrap_or(None);
             // The primary service's first port decides the tap's protocol, matching the
             // docker backend. `primary_protocol` is already resolved above.
-            let tap_spec = (capture_mode(config) == CaptureMode::Tap).then(|| compose::TapSpec {
-                proto: primary_protocol.clone(),
-                capture_dir: docker::capture_dir(&project_name),
-                instance_id: project_name.clone(),
-            });
+            let tap_spec = tap_enabled(config, challenge_name, runner_ssh)
+                .await
+                .then(|| compose::TapSpec {
+                    proto: primary_protocol.clone(),
+                    capture_dir: docker::capture_dir(&project_name),
+                    instance_id: project_name.clone(),
+                });
             let (_, project) = compose::up(
                 &compose_path,
                 &project_name,

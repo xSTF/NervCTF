@@ -272,6 +272,34 @@ pub fn legacy_proxy_container_name(container_name: &str) -> String {
     format!("{}-proxy", container_name)
 }
 
+/// The tap sidecar image. Built locally by the Ansible playbook
+/// (`docker build -t nervctf-tap:latest`) and never published to a registry, so a
+/// missing image cannot be recovered by pulling — see `tap_image_available`.
+pub const TAP_IMAGE: &str = "nervctf-tap:latest";
+
+/// Whether `TAP_IMAGE` exists on the daemon that will run challenge containers
+/// (the runner in split-machine mode, this host otherwise).
+///
+/// The playbook only builds the image when `nervctf setup` found a `nervctf-tap`
+/// binary to ship, so a deployment can legitimately be missing it. Compose and
+/// `docker run` would then try to pull `nervctf-tap:latest` from Docker Hub and fail
+/// the whole provision with "pull access denied ... repository does not exist", which
+/// points at credentials rather than at the real cause. Callers check this first and
+/// provision without capture instead.
+pub async fn tap_image_available(runner_ssh: Option<&str>) -> bool {
+    let output = if let Some(target) = runner_ssh {
+        ssh_output(target, &format!("docker image inspect '{}'", TAP_IMAGE)).await
+    } else {
+        tokio::process::Command::new("docker")
+            .args(["image", "inspect", TAP_IMAGE])
+            .output()
+            .await
+    };
+    // Treat a failure to even run docker/ssh as "absent": provisioning without capture
+    // degrades observability, provisioning with an unverifiable image fails outright.
+    output.map(|o| o.status.success()).unwrap_or(false)
+}
+
 /// Host directory holding `nervctf-tap` captures, mounted into the monitor at the
 /// same path so no path translation is needed (same convention as `/tmp/ctf-flags`).
 pub fn capture_base_dir() -> String {

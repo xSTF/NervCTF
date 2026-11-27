@@ -101,7 +101,13 @@ fn tap_service_block(
         format!("{}:8080", host_port)
     };
     let mut out = String::from("  tap:\n");
-    out.push_str("    image: nervctf-tap:latest\n");
+    out.push_str(&format!("    image: {}\n", super::docker::TAP_IMAGE));
+    // `pull_policy: never` because the image is built locally by the playbook and
+    // exists in no registry: without it compose tries Docker Hub when the image is
+    // absent and fails with a credentials error that hides the real cause. Callers
+    // already skip the sidecar in that case (`tap_enabled`); this keeps a race or a
+    // hand-edited override honest about what is wrong.
+    out.push_str("    pull_policy: never\n");
     out.push_str("    restart: unless-stopped\n");
     out.push_str("    ports:\n");
     out.push_str(&format!("      - {}\n", yaml_quote(&port_spec)));
@@ -711,6 +717,8 @@ mod tests {
             keys,
             vec![
                 "image: nervctf-tap:latest",
+                // Never pull: the image is local-only (see tap_service_block).
+                "pull_policy: never",
                 "restart: unless-stopped",
                 "ports:",
                 "environment:",
