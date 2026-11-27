@@ -929,7 +929,13 @@
                 password: "{{ ctfd_db_pass }}"
         dest: "{{ ctfd_path }}/grafana/provisioning/datasources/mysql.yml"
         owner: "{{ docker_user }}"
-        group: docker
+        # Group root, not docker: the Grafana image runs as uid 472 / gid 0, so it is
+        # neither the owner nor in the `docker` group and cannot read a 0640 file —
+        # provisioning then fails with "permission denied" and Grafana crash-loops,
+        # taking every dashboard down with it. Group 0 lets Grafana read it while
+        # keeping the file non-world-readable, which matters here because unlike the
+        # other datasource files this one carries a credential.
+        group: "0"
         mode: "0640"
 
     - name: Write Grafana Infinity datasource (remote-monitor's admin JSON API)
@@ -948,7 +954,13 @@
                 httpHeaderValue1: "Token {{ monitor_token }}"
         dest: "{{ ctfd_path }}/grafana/provisioning/datasources/infinity.yml"
         owner: "{{ docker_user }}"
-        group: docker
+        # Group root, not docker: the Grafana image runs as uid 472 / gid 0, so it is
+        # neither the owner nor in the `docker` group and cannot read a 0640 file —
+        # provisioning then fails with "permission denied" and Grafana crash-loops,
+        # taking every dashboard down with it. Group 0 lets Grafana read it while
+        # keeping the file non-world-readable, which matters here because unlike the
+        # other datasource files this one carries a credential.
+        group: "0"
         mode: "0640"
 
     - name: Resolve runner hostname to IP on CTFd host
