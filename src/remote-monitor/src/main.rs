@@ -2063,6 +2063,22 @@ async fn admin_event_set(
                 &format!("unsupported event key '{}'", key),
             );
         }
+        // CTFd resolves any `user_mode` other than these two to no account model,
+        // after which /challenges and /admin/statistics return 500 for everyone. The
+        // allowlist above only guards which *keys* may be written, so the value needs
+        // checking here as well — `nervctf event apply` reaches this path directly.
+        if key == "user_mode" {
+            let v = value.as_str().unwrap_or_default();
+            if !matches!(v, "users" | "teams") {
+                return ctfd_err(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "user_mode must be 'users' or 'teams', got '{}' — CTFd would                          resolve that to no account model and return 500 on every                          mode-dependent page",
+                        v
+                    ),
+                );
+            }
+        }
         let text = match value {
             Value::String(s) => s.clone(),
             Value::Bool(b) => b.to_string(),

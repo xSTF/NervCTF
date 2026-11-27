@@ -426,7 +426,17 @@ fn public_key_contents(key: &str) -> Result<String> {
 /// Add the event and first-admin settings to the Ansible extra-vars. The
 /// playbooks write them into the CTFd container environment, where the plugin
 /// consumes them only while CTFd has not been set up.
-fn push_event_and_admin_evars(config: &Config, evars: &mut Vec<String>) {
+/// The only two values CTFd accepts for `user_mode`.
+///
+/// CTFd's `get_model()` returns `Users` for "users", `Teams` for "teams", and **None**
+/// for anything else — after which every mode-dependent page (`/challenges`,
+/// `/admin/statistics`) raises `AttributeError: 'NoneType' object has no attribute
+/// 'id'` and returns 500. A typo as small as `user_mode: user` in `.nervctf.yml` was
+/// therefore enough to take a live CTF's player-facing pages down, because this value
+/// was passed straight through to CTFd's first-run setup unchecked.
+pub const VALID_USER_MODES: &[&str] = &["users", "teams"];
+
+fn push_event_and_admin_evars(config: &Config, evars: &mut Vec<String>) -> Result<()> {
     // The plugin needs an event name to complete CTFd's first-run setup. If the
     // config has no `event:` block, pass a default so setup never leaves CTFd
     // stuck on the wizard.
@@ -445,6 +455,15 @@ fn push_event_and_admin_evars(config: &Config, evars: &mut Vec<String>) {
         evars.push(format!("event_description={}", v));
     }
     if let Some(v) = user_mode {
+        if !VALID_USER_MODES.contains(&v) {
+            return Err(anyhow!(
+                "event.user_mode is '{}', which CTFd does not understand — use one of: {}.\n\
+                 CTFd resolves any other value to no account model at all, which makes\n\
+                 /challenges and /admin/statistics return 500 for every user.",
+                v,
+                VALID_USER_MODES.join(", "),
+            ));
+        }
         evars.push(format!("user_mode={}", v));
     }
     if let Some(ref ad) = config.admin {
@@ -460,6 +479,7 @@ fn push_event_and_admin_evars(config: &Config, evars: &mut Vec<String>) {
             }
         }
     }
+    Ok(())
 }
 
 pub fn run_setup() -> Result<()> {
@@ -736,7 +756,7 @@ pub fn run_setup() -> Result<()> {
             evars.push(format!("runner_domain={}", domain));
         }
     }
-    push_event_and_admin_evars(&config, &mut evars);
+    push_event_and_admin_evars(&config, &mut evars)?;
     let mut inventory = format!(
         "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'\n",
         monitor_ip, monitor_user
@@ -991,7 +1011,7 @@ pub fn run_upgrade() -> Result<()> {
             evars.push(format!("runner_domain={}", domain));
         }
     }
-    push_event_and_admin_evars(&config, &mut evars);
+    push_event_and_admin_evars(&config, &mut evars)?;
 
     let mut inventory = format!(
         "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'\n",
@@ -1035,3 +1055,67 @@ pub fn run_upgrade() -> Result<()> {
     Ok(())
 }
 
+
+#[cfg(test)]
+mod user_mode_tests {
+    use super::{push_event_and_admin_evars, VALID_USER_MODES};
+    use crate::utils::Config;
+
+    fn cfg(yaml: &str) -> Config {
+        serde_yaml::from_str(yaml).expect("parse config")
+    }
+
+    #[test]
+    fn a_mistyped_user_mode_is_rejected_before_it_reaches_ctfd() {
+        // The exact typo that took a live CTF's /challenges and /admin/statistics
+        // down: CTFd resolves "user" to no account model and returns 500.
+        let c = cfg("event:\n  name: x\n  user_mode: user\n");
+        let mut evars = Vec::new();
+        let err = push_event_and_admin_evars(&c, &mut evars)
+            .expect_err("'user' must not be accepted");
+        let msg = err.to_string();
+        assert!(msg.contains("user_mode is 'user'"), "{}", msg);
+        assert!(msg.contains("users, teams"), "{}", msg);
+        // Nothing may be emitted for a rejected config.
+        assert!(!evars.iter().any(|e| e.starts_with("user_mode=")), "{:?}", evars);
+    }
+
+    #[test]
+    fn both_valid_modes_pass_through_verbatim() {
+        for mode in VALID_USER_MODES {
+            let c = cfg(&format!("event:\n  name: x\n  user_mode: {}\n", mode));
+            let mut evars = Vec::new();
+            push_event_and_admin_evars(&c, &mut evars).expect("valid mode");
+            assert!(
+                evars.contains(&format!("user_mode={}", mode)),
+                "{:?}",
+                evars
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_user_mode_is_still_allowed() {
+        // Omitting it is legitimate: CTFd keeps whatever it already has, and the
+        // plugin defaults to teams on a first-run setup.
+        let c = cfg("event:\n  name: x\n");
+        let mut evars = Vec::new();
+        push_event_and_admin_evars(&c, &mut evars).expect("absent mode is fine");
+        assert!(!evars.iter().any(|e| e.starts_with("user_mode=")), "{:?}", evars);
+    }
+
+    #[test]
+    fn case_and_whitespace_variants_are_rejected_not_silently_coerced() {
+        // CTFd compares the raw string, so "Users" and " users" are just as broken
+        // as "user". Failing loudly beats guessing what was meant.
+        for bad in ["Users", "TEAMS", " users", "team", "individual", ""] {
+            let c = cfg(&format!("event:\n  name: x\n  user_mode: \"{}\"\n", bad));
+            let mut evars = Vec::new();
+            assert!(
+                push_event_and_admin_evars(&c, &mut evars).is_err(),
+                "{:?} should be rejected",
+                bad
+            );
+        }
+    }
+}
