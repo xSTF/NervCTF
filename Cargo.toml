@@ -9,7 +9,7 @@ resolver = "2"
 
 [workspace.package]
 name = "nervctf"
-version = "2.8.0"
+version = "2.9.0"
 
 [profile.release]
 opt-level   = "z"   # optimize for size over speed
