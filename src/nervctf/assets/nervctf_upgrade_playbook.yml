@@ -999,6 +999,21 @@
       set_fact:
         monitor_pubkey: "{{ monitor_pubkey_raw.content | b64decode | trim }}"
 
+    # ── External reverse proxy (external_proxy) ───────────────────────────────
+    # See the matching block in nervctf_playbook.yml for the full rationale: CTFd's
+    # bundled nginx binds :80 and loses to a host proxy that already holds it, failing
+    # the whole `compose up`. Probed against the BASE compose file only, never the
+    # override written below.
+    - name: Check whether CTFd's compose file defines an nginx service
+      command: docker compose -f {{ ctfd_path }}/docker-compose.yml config --services
+      register: ctfd_compose_services
+      changed_when: false
+      failed_when: false
+
+    - name: Record whether CTFd ships its own nginx
+      set_fact:
+        ctfd_has_nginx: "{{ 'nginx' in (ctfd_compose_services.stdout_lines | default([])) }}"
+
     - name: Write docker-compose override
       when: monitor_token is defined
       copy:
@@ -1137,6 +1152,16 @@
                 - prometheus
                 - loki
 
+          {% if external_proxy | default(false) | bool and ctfd_has_nginx | default(false) | bool %}
+            # external_proxy: true — the host terminates HTTP(S), so CTFd's bundled
+            # nginx must not compete for :80. A compose profile leaves the service
+            # defined but never started; `--remove-orphans` on the recreate below reaps
+            # any container an earlier run already created. nervctf deliberately does
+            # not touch CTFd's own port mappings — point the host proxy at CTFd's
+            # published port (8000 by default). See docs/remote-monitor.md.
+            nginx:
+              profiles: ["nervctf-disabled"]
+          {% endif %}
           # Explicitly declare the networks used by remote-monitor so Docker Compose
           # correctly joins it to the existing project networks (not creating new ones).
           networks:
@@ -1171,7 +1196,7 @@
     # and the old upstream IP, which produces 502s after ctfd is recreated).
     - name: Recreate CTFd stack (applies env, reloads plugin, refreshes nginx)
       command:
-        cmd: docker compose up -d --force-recreate
+        cmd: docker compose up -d --force-recreate --remove-orphans
         chdir: "{{ ctfd_path }}"
       become_user: "{{ docker_user }}"
       when: plugin_src is defined

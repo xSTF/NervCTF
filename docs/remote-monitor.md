@@ -70,6 +70,42 @@ In split-machine mode, Docker commands run on a separate worker node over SSH (`
 
 ---
 
+## External reverse proxy (`external_proxy`)
+
+CTFd's upstream `docker-compose.yml` ships an `nginx` service bound to `:80`. If the
+host already terminates HTTP(S) itself — an apt-installed nginx holding `:80`/`:443`
+with the TLS certificate is the common case — that service loses the bind and fails
+the whole `docker compose up`:
+
+```
+failed to bind host port 0.0.0.0:80/tcp: address already in use
+```
+
+Compose aborts the rest of the `up` at that point, so unrelated services (Grafana in
+particular) are left stopped too, and every `nervctf setup` run fails the same way.
+
+Set `external_proxy: true` in `.nervctf.yml`. The per-instance override then gains:
+
+```yaml
+services:
+  nginx:
+    profiles: ["nervctf-disabled"]
+```
+
+A service with a profile stays defined but is never started, so `:80` is left to the
+host proxy. `--remove-orphans` on the recreate reaps any nginx container an earlier
+run already created. If the CTFd checkout has no `nginx` service at all, the stanza is
+omitted — a service consisting only of `profiles:` would be a Compose config error.
+
+**nervctf does not touch CTFd's port mappings.** Point the host proxy at CTFd's own
+published port (`8000` by default); nervctf's "Resolve CTFd's published HTTP port" task
+already prefers that mapping over nginx's.
+
+Unset leaves the bundled nginx exactly as it was, so enabling this cannot change an
+existing deployment by accident.
+
+---
+
 ## Traffic capture (`capture: tap`)
 
 An instance whose config resolves to `capture: tap` (explicitly, or via the superseded

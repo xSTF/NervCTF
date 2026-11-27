@@ -69,6 +69,17 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub challenges_path: Option<String>,
 
+    /// `true` when something on the host already terminates HTTP(S) in front of CTFd
+    /// — typically an apt-installed nginx holding :80/:443 with the TLS certificate.
+    ///
+    /// CTFd's own `docker-compose.yml` ships an `nginx` service that binds :80, which
+    /// then loses to the host's. Setting this puts that service behind a compose
+    /// profile so it is defined but never started, leaving :80 to the host proxy.
+    /// The host proxy must point at CTFd's published port itself; nervctf does not
+    /// change CTFd's port mappings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_proxy: Option<bool>,
+
     // Monitor tuning
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_provisions: Option<u32>,

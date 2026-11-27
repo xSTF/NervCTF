@@ -740,6 +740,11 @@ pub fn run_setup() -> Result<()> {
     if let Some(ref bin) = tap_binary {
         evars.push(format!("tap_binary={}", bin.display()));
     }
+    // Only passed when true: an absent var leaves CTFd's bundled nginx untouched,
+    // so this cannot change the behaviour of an existing deployment by accident.
+    if config.external_proxy.unwrap_or(false) {
+        evars.push("external_proxy=true".to_string());
+    }
     if let Some(ref rip) = runner_ip {
         evars.push(format!("runner_ip={}", rip));
     }
@@ -985,6 +990,11 @@ pub fn run_upgrade() -> Result<()> {
     }
     if let Some(ref bin) = tap_binary {
         evars.push(format!("tap_binary={}", bin.display()));
+    }
+    // Only passed when true: an absent var leaves CTFd's bundled nginx untouched,
+    // so this cannot change the behaviour of an existing deployment by accident.
+    if config.external_proxy.unwrap_or(false) {
+        evars.push("external_proxy=true".to_string());
     }
     // Pass runner vars so the upgrade playbook can write the correct
     // RUNNER_SSH_TARGET / CHALLENGES_BASE_DIR into the docker-compose override.

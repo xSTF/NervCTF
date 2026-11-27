@@ -17,6 +17,23 @@ ssh_key_path: ~/.ssh/id_rsa          # [setup] SSH private key (passed to ssh/rs
 # ── Local challenge directory ──────────────────────────────────────────────────
 challenges_path: ./challenges        # Path to your top-level challenges directory
 
+# ── External reverse proxy (optional) ──────────────────────────────────────────
+# Set this when something on the host already serves HTTP(S) in front of CTFd —
+# typically an apt-installed nginx holding :80/:443 with your TLS certificate.
+#
+# CTFd's own docker-compose.yml ships an `nginx` service bound to :80. On such a
+# host it loses that bind and fails the entire `docker compose up`, which takes
+# the rest of the stack (Grafana included) down with it:
+#
+#   failed to bind host port 0.0.0.0:80/tcp: address already in use
+#
+# With external_proxy: true, that service is put behind a Compose profile, so it
+# stays defined but is never started and :80 is left to your host proxy.
+#
+# nervctf does NOT change CTFd's own port mappings — point your host proxy at
+# CTFd's published port (8000 by default).
+# external_proxy: true
+
 # ── Tuning (optional) ──────────────────────────────────────────────────────────
 # These are baked into the remote-monitor environment at setup time.
 # Changing them here has no effect until you re-run `nervctf setup --upgrade`.
